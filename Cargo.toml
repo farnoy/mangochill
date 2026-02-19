@@ -1,0 +1,66 @@
+[workspace]
+members = [".", "wasm-playground"]
+default-members = ["."]
+
+[package]
+name = "mangochill"
+version = "0.1.0"
+edition = "2024"
+
+build = "build.rs"
+
+[[bin]]
+name = "mangochill-server"
+path = "src/server.rs"
+
+[[bin]]
+name = "mangochill-raw-export"
+path = "src/raw_export.rs"
+
+[[bin]]
+name = "mangochill-client"
+path = "src/client.rs"
+
+[[bin]]
+name = "mangochill-replay"
+path = "src/replay.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+anyhow = "1.0.101"
+capnp = "0.21.7"
+capnp-rpc = "0.21.0"
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.50", features = ["derive"] }
+clap-verbosity-flag = "3.0.4"
+env_logger = "0.11.8"
+futures = { version = "0.3.31", default-features = false }
+libc = "0.2.177"
+nix = { version = "0.30", features = ["ioctl", "time"] }
+log = { version = "0.4.28", features = ["release_max_level_info"] }
+mimalloc = { version = "0.1.48", features = ["debug_in_debug", "v3"] }
+regex = "1.12.3"
+serde_json = "1.0.145"
+tokio = { version = "1.48.0", features = [
+  "fs",
+  "io-util",
+  "macros",
+  "net",
+  "parking_lot",
+  "rt",
+  "signal",
+  "time",
+] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
+tokio-util = { version = "0.7.16", features = ["compat", "rt"] }
+
+[build-dependencies]
+capnpc = "0.21.4"
+
+[profile.release]
+debug = "line-tables-only"
