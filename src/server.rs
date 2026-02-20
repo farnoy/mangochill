@@ -269,7 +269,8 @@ fn discover_mouse_devices() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for entry in dir.flatten() {
         let name = entry.file_name();
-        if name.as_encoded_bytes().ends_with(b"-event-mouse") {
+        let is_event = name.to_str().unwrap().contains("-event");
+        if is_event {
             match std::fs::canonicalize(entry.path()) {
                 Ok(p) => paths.push(p),
                 Err(e) => warn!("canonicalize {:?}: {e}", entry.path()),
