@@ -6,8 +6,9 @@ When you're actively using your mouse, FPS ramps up; when idle, it tapers off to
 Read more in the [blog post](https://farnoy.dev/posts/mangochill).
 Try the [interactive tuner](https://farnoy.dev/tools/mangochill-tuner) to experiment with parameters using your own mouse.
 
-<video class="video-prose" controls loop autoplay muted playsinline width="817" height="626" src="https://farnoy.dev/assets/mangochill-demo.webm" />
-
+<video controls loop autoplay muted playsinline src="https://github.com/user-attachments/assets/bfbe3216-5336-4505-bcef-5a46d9af50a1" width="817" height="626" type="video/webm" >
+  Demo video
+</video>
 
 Uses an exponentially weighted envelope follower with asymmetric attack and release half-lives, borrowed from audio signal processing.
 The attack/release asymmetry lets FPS ramp up quickly for responsiveness while decaying slowly for smoothness.
