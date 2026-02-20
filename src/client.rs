@@ -46,6 +46,14 @@ struct Cli {
     /// Unix socket path to the RPC server
     #[arg(short = 's', long)]
     rpc_socket: Option<PathBuf>,
+
+    /// Timeout in seconds waiting for MangoHud socket to appear
+    #[arg(long, default_value = "10")]
+    socket_timeout_secs: u64,
+
+    /// Command to spawn (e.g., -- mangohud game)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 struct FpsReceiverImpl {
@@ -74,18 +82,70 @@ async fn main() -> anyhow::Result<()> {
 
     let ct = CancellationToken::new();
 
-    let data = std::fs::read_to_string("/proc/net/unix")?;
-    let regex = Regex::new(r"@(mangohud-\d+)").expect("regex invalid");
-    let Some(m) = regex.captures(&data) else {
-        return Err(anyhow!(
-            "MangoHud socket not found, is it running? Have you configured `control = mangohud-%p`?"
-        ));
+    // Either spawn a child and wait for its specific socket, or scan for any existing one.
+    // NOTE: Seems to be good enough for mangochill-client -- gamemoderun mangohud %command%
+    //       but we might want to look at the first mangohud socket with pid >= child_pid?
+    //       It probably only works because gamemoderun does an exec()?
+    let (socket_name, mut child) = if cli.command.is_empty() {
+        let data = std::fs::read_to_string("/proc/net/unix")?;
+        let regex = Regex::new(r"@(mangohud-\d+)").expect("regex invalid");
+        let Some(m) = regex.captures(&data) else {
+            return Err(anyhow!(
+                "MangoHud socket not found, is it running and \
+                configured with `control = mangohud-%p`?"
+            ));
+        };
+        (m.get(1).unwrap().as_str().to_owned(), None)
+    } else {
+        let mut child = tokio::process::Command::new(&cli.command[0])
+            .args(&cli.command[1..])
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn `{}`: {e}", cli.command[0]))?;
+
+        let child_pid = child
+            .id()
+            .ok_or_else(|| anyhow!("Child exited immediately after spawn"))?;
+        info!("Spawned child process (PID {child_pid}): {:?}", cli.command);
+
+        let target = format!("mangohud-{child_pid}");
+        let mut poll = interval(Duration::from_millis(100));
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let wait_for_socket = async {
+            loop {
+                if let Ok(data) = std::fs::read_to_string("/proc/net/unix")
+                    && data.contains(&format!("@{target}"))
+                {
+                    break Ok(target);
+                }
+
+                tokio::select! {
+                    _ = poll.tick() => {}
+                    status = child.wait() => {
+                        let status = status?;
+                        return Err(anyhow!(
+                            "Child exited ({status}) before MangoHud socket appeared. \
+                            Is MangoHud configured with `control = mangohud-%p`?"
+                        ));
+                    }
+                }
+            }
+        };
+        let duration = Duration::from_secs(cli.socket_timeout_secs);
+        let socket_name = timeout(duration, wait_for_socket).await;
+
+        let socket_name = socket_name.map_err(|elapsed| {
+            anyhow!(
+                "Timed out after {elapsed} waiting for @mangohud-{child_pid} MangoHud \
+                socket to appear. Is MangoHud configured with `control = mangohud-%p`?"
+            )
+        })??;
+        (socket_name, Some((child, child_pid)))
     };
-    let socket_name = m.get(1).unwrap().as_str();
+
     info!("Using MangoHud socket: {socket_name}");
     let addr =
         <std::os::unix::net::SocketAddr as std::os::linux::net::SocketAddrExt>::from_abstract_name(
-            socket_name,
+            &socket_name,
         )?;
     let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
     let writer = Rc::new(RefCell::new(stream));
@@ -176,12 +236,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    set.run_until(async {
-        let _guard = ct.drop_guard_ref();
-        mangochill::termination_signal().await;
-        info!("exiting");
-    })
-    .await;
+    if let Some((child, child_pid)) = &mut child {
+        tokio::select! {
+            _ = mangochill::termination_signal() => {
+                info!("Signal received, shutting down child...");
+                unsafe { libc::kill(*child_pid as i32, libc::SIGTERM); }
+                if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                    warn!("Child did not exit after SIGTERM, sending SIGKILL");
+                    let _ = child.kill().await;
+                }
+            }
+            _ = child.wait() => { }
+        }
+    }
 
     ct.cancel();
 

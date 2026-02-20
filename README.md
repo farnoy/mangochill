@@ -24,6 +24,9 @@ Device polling rates are detected automatically so the algorithm behaves consist
 
 ```sh
 $ nix run github:farnoy/mangochill#mangochill-client -- -vv --min-fps 10 --max-fps 60 --attack-half-life-ms 600 --release-half-life-ms 2000
+
+# use mangochill in your command line chain:
+PROTON_ADD_CONFIG=... gamemoderun mangochill-client ... -- mangohud %command%
 ```
 
 ## Development

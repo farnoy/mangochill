@@ -75,7 +75,7 @@ pub fn init_logging(filter: log::LevelFilter) {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn monotonic_us() -> i64 {
-    use nix::time::{clock_gettime, ClockId};
+    use nix::time::{ClockId, clock_gettime};
     let ts = clock_gettime(ClockId::CLOCK_MONOTONIC).unwrap();
     ts.tv_sec() * 1_000_000 + ts.tv_nsec() / 1000
 }
