@@ -408,15 +408,14 @@ async fn watch_device(
         };
 
         timestamps_us.reserve(aligned.len());
-        let mut len = 0;
         let mut prev = i64::MIN;
         for ev in aligned {
             let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
-            unsafe { *timestamps_us.get_unchecked_mut(len) = ts_us };
-            len = hint::select_unpredictable(ts_us != prev, len + 1, len);
+            if (ts_us != prev) {
+                timestamps_us.push(ts_us);
+            }
             prev = ts_us;
         }
-        unsafe { timestamps_us.set_len(len) };
 
         feed_events(&mut fps_subscribers.borrow_mut(), device_id, &timestamps_us);
 
