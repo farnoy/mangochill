@@ -10,15 +10,17 @@
       url = "github:nix-community/crate2nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    cache-nix-action = {
+      url = "github:nix-community/cache-nix-action";
+      flake = false;
+    };
+    systems.url = "github:nix-systems/default";
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
+    inputs@{ flake-parts, systems, cache-nix-action, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } {
-      systems = [
-        "x86_64-linux"
-        "aarch64-linux"
-      ];
+      systems = import systems;
 
       flake = {
         nixosModules.default = import ./nix/module.nix inputs;
@@ -147,6 +149,14 @@
             (pkgs.mangohud.override {
               mangohud32 = pkgs.pkgsi686Linux.mangohud.overrideAttrs mangoOverride;
             }).overrideAttrs mangoOverride;
+
+          devShell = pkgs.mkShell {
+            nativeBuildInputs = [
+              pkgs.capnproto
+              pkgs.wasm-pack
+              rustToolchain
+            ];
+          };
         in
         {
           packages = {
@@ -156,14 +166,23 @@
             mangohud = mangohud;
           };
 
-          devShells.default = pkgs.mkShell {
-            inputsFrom = [ mangochill ];
-            nativeBuildInputs = [
-              pkgs.capnproto
-              pkgs.wasm-pack
-              rustToolchain
-            ];
-          };
+          devShells.default = devShell;
+
+          packages.saveFromGC =
+            (import "${cache-nix-action}/saveFromGC.nix" {
+              inherit pkgs inputs;
+              inputsInclude = [
+                "nixpkgs"
+                "crate2nix"
+                "flake-parts"
+                "fenix"
+                "systems"
+              ];
+              derivations = [
+                devShell
+              ];
+              paths = [];
+            }).package;
         };
     };
 }
