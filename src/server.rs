@@ -411,7 +411,7 @@ async fn watch_device(
         let mut prev = i64::MIN;
         for ev in aligned {
             let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
-            if ts_us != prev  {
+            if ts_us != prev {
                 timestamps_us.push(ts_us);
             }
             prev = ts_us;
