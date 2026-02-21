@@ -5,8 +5,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::anyhow;
-use capnp::capability::Promise;
-use capnp_rpc::pry;
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
 use log::{info, warn};
@@ -63,15 +61,19 @@ struct FpsReceiverImpl {
 }
 
 impl mangochill_capnp::fps_receiver::Server for FpsReceiverImpl {
-    fn receive(&mut self, params: ReceiveParams, _: ReceiveResults) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
+    async fn receive(
+        self: Rc<Self>,
+        params: ReceiveParams,
+        _: ReceiveResults,
+    ) -> Result<(), capnp::Error> {
+        let p = params.get()?;
         let fps = p.get_fps_limit();
         let target = (fps.round() as u16).clamp(self.min_fps, self.max_fps);
         let cmd = format!(":set_fps_limit={target};\n");
         if let Err(e) = self.writer.borrow_mut().write_all(cmd.as_bytes()) {
-            return Promise::err(capnp::Error::failed(e.to_string()));
+            return Err(capnp::Error::failed(e.to_string()));
         }
-        Promise::ok(())
+        Ok(())
     }
 }
 

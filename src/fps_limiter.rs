@@ -2,8 +2,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
-use capnp::capability::Promise;
-use capnp_rpc::pry;
 use log::{info, warn};
 use std::collections::HashMap;
 use tokio::sync::Notify;
@@ -39,7 +37,7 @@ impl FpsSubscribers {
 }
 
 pub struct FpsLimiterImpl {
-    next_id: u32,
+    next_id: RefCell<u32>,
     subscribers: Rc<RefCell<FpsSubscribers>>,
     ct: CancellationToken,
     notify: Rc<Notify>,
@@ -52,7 +50,7 @@ impl FpsLimiterImpl {
         notify: Rc<Notify>,
     ) -> Self {
         Self {
-            next_id: 0,
+            next_id: RefCell::new(0),
             subscribers,
             ct,
             notify,
@@ -61,32 +59,36 @@ impl FpsLimiterImpl {
 }
 
 impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
-    fn register(
-        &mut self,
+    async fn register(
+        self: Rc<Self>,
         params: mangochill_capnp::fps_limiter::RegisterParams,
         mut ret: mangochill_capnp::fps_limiter::RegisterResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
+    ) -> Result<(), capnp::Error> {
+        let p = params.get()?;
         let frequency_hz = p.get_frequency_hz();
         if !(1..=1000).contains(&frequency_hz) {
-            return Promise::err(capnp::Error::failed(
+            return Err(capnp::Error::failed(
                 "frequencyHz must be within 1-1000".to_string(),
             ));
         }
         let min_fps = p.get_min_fps();
         let max_fps = p.get_max_fps();
         if min_fps >= max_fps || max_fps == 0 {
-            return Promise::err(capnp::Error::failed("invalid fps range".to_string()));
+            return Err(capnp::Error::failed("invalid fps range".to_string()));
         }
         let short_hl = p.get_attack_half_life_microseconds();
         let long_hl = p.get_release_half_life_microseconds();
         if short_hl == 0 || long_hl == 0 {
-            return Promise::err(capnp::Error::failed("half-lives must be > 0".to_string()));
+            return Err(capnp::Error::failed("half-lives must be > 0".to_string()));
         }
-        let handle = pry!(p.get_receiver());
+        let handle = p.get_receiver()?;
 
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = {
+            let mut cell = self.next_id.borrow_mut();
+            let i = *cell;
+            *cell += 1;
+            i
+        };
 
         self.subscribers.borrow_mut().map.insert(
             id,
@@ -116,7 +118,7 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
         info!(
             "fps subscriber {id} registered: {frequency_hz}Hz, fps {min_fps}-{max_fps}, attack/release {short_hl}/{long_hl}µs"
         );
-        Promise::ok(())
+        Ok(())
     }
 }
 

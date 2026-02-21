@@ -1,8 +1,7 @@
-use capnp::capability::Promise;
-use capnp_rpc::pry;
 use chrono::{DateTime, Utc};
 use mangochill::{LogRecord, connect_rpc};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
@@ -41,13 +40,17 @@ struct Receiver {
 }
 
 impl mangochill_capnp::poll_receiver::Server for Receiver {
-    fn receive(&mut self, params: ReceiveParams, _: ReceiveResults) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
+    async fn receive(
+        self: Rc<Self>,
+        params: ReceiveParams,
+        _: ReceiveResults,
+    ) -> Result<(), capnp::Error> {
+        let p = params.get()?;
         let now = Utc::now();
         let mono_to_real_us = now.timestamp_micros() - mangochill::monotonic_us();
-        let collected_at = pry!(p.get_collected_at());
+        let collected_at = p.get_collected_at()?;
         let collected_at = mono_to_real(mono_to_real_us, &collected_at);
-        let readings = pry!(p.get_readings());
+        let readings = p.get_readings()?;
         let readings = readings
             .into_iter()
             .map(|r| mono_to_real(mono_to_real_us, &r))
@@ -61,7 +64,7 @@ impl mangochill_capnp::poll_receiver::Server for Receiver {
         if let Err(e) = self.tx.send(serialized) {
             warn!("Failed to send event to writer: {}", e);
         }
-        Promise::ok(())
+        Ok(())
     }
 }
 

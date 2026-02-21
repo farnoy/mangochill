@@ -1,5 +1,4 @@
-use capnp::capability::Promise;
-use capnp_rpc::{RpcSystem, pry};
+use capnp_rpc::RpcSystem;
 use futures::FutureExt;
 use std::{
     cell::RefCell,
@@ -65,7 +64,7 @@ struct RawSubscribers {
 }
 
 struct RawServerImpl {
-    next_id: u32,
+    next_id: RefCell<u32>,
     subscribers: Rc<RefCell<RawSubscribers>>,
     notify: Rc<Notify>,
 }
@@ -76,29 +75,31 @@ struct RawSubscriber {
 }
 
 impl mangochill_capnp::raw_events::Server for RawServerImpl {
-    fn register(
-        &mut self,
+    async fn register(
+        self: Rc<Self>,
         params: RegisterParams,
         mut ret: RegisterResults,
-    ) -> Promise<(), capnp::Error> {
-        let p = pry!(params.get());
-        let handle = pry!(p.get_receiver());
-        self.subscribers.borrow_mut().map.insert(
-            self.next_id,
-            RawSubscriber {
-                id: self.next_id,
-                handle,
-            },
-        );
+    ) -> Result<(), capnp::Error> {
+        let p = params.get()?;
+        let handle = p.get_receiver()?;
+        let id = {
+            let mut cell = self.next_id.borrow_mut();
+            let i = *cell;
+            *cell += 1;
+            i
+        };
+        self.subscribers
+            .borrow_mut()
+            .map
+            .insert(id, RawSubscriber { id, handle });
         self.notify.notify_one();
         let disconnector = capnp_rpc::new_client(RawDisconnector {
-            id: self.next_id,
+            id,
             subscribers: Rc::clone(&self.subscribers),
             notify: Rc::clone(&self.notify),
         });
-        self.next_id += 1;
         ret.get().set_subscription(disconnector);
-        Promise::ok(())
+        Ok(())
     }
 }
 
@@ -189,7 +190,7 @@ async fn serve(
 
     let raw_events_client: Option<mangochill_capnp::raw_events::Client> = if expose_raw {
         Some(capnp_rpc::new_client(RawServerImpl {
-            next_id: 0,
+            next_id: RefCell::new(0),
             subscribers: raw_subscribers,
             notify,
         }))

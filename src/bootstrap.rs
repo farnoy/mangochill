@@ -1,4 +1,4 @@
-use capnp::capability::Promise;
+use std::rc::Rc;
 
 use crate::mangochill_capnp;
 
@@ -20,26 +20,26 @@ impl MangoChillImpl {
 }
 
 impl mangochill_capnp::mango_chill::Server for MangoChillImpl {
-    fn fps_limiter(
-        &mut self,
+    async fn fps_limiter(
+        self: Rc<Self>,
         _: mangochill_capnp::mango_chill::FpsLimiterParams,
         mut ret: mangochill_capnp::mango_chill::FpsLimiterResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> Result<(), capnp::Error> {
         ret.get().set_service(self.fps_limiter.clone());
-        Promise::ok(())
+        Ok(())
     }
 
-    fn raw_events(
-        &mut self,
+    async fn raw_events(
+        self: Rc<Self>,
         _: mangochill_capnp::mango_chill::RawEventsParams,
         mut ret: mangochill_capnp::mango_chill::RawEventsResults,
-    ) -> Promise<(), capnp::Error> {
+    ) -> Result<(), capnp::Error> {
         match &self.raw_events {
             Some(client) => {
                 ret.get().set_service(client.clone());
-                Promise::ok(())
+                Ok(())
             }
-            None => Promise::err(capnp::Error::failed(
+            None => Err(capnp::Error::failed(
                 "raw events not enabled (server needs --raw flag)".to_string(),
             )),
         }
