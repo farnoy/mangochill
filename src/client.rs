@@ -236,19 +236,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }));
 
-    if let Some((child, child_pid)) = &mut child {
-        tokio::select! {
-            _ = mangochill::termination_signal() => {
-                info!("Signal received, shutting down child...");
-                unsafe { libc::kill(*child_pid as i32, libc::SIGTERM); }
-                if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
-                    warn!("Child did not exit after SIGTERM, sending SIGKILL");
-                    let _ = child.kill().await;
+    set.run_until(async move {
+        match &mut child {
+            None => {
+                mangochill::termination_signal().await;
+                info!("exiting");
+            }
+            Some((child, child_pid)) => {
+                tokio::select! {
+                    _ = mangochill::termination_signal() => {
+                        info!("Signal received, shutting down child...");
+                        unsafe { libc::kill(*child_pid as i32, libc::SIGTERM); }
+                        if timeout(Duration::from_secs(5), child.wait()).await.is_err() {
+                            warn!("Child did not exit after SIGTERM, sending SIGKILL");
+                            let _ = child.kill().await;
+                        }
+                    }
+                    _ = child.wait() => { }
                 }
             }
-            _ = child.wait() => { }
         }
-    }
+    })
+    .await;
 
     ct.cancel();
 
