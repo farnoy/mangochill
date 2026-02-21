@@ -1,0 +1,29 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+      - run: nix develop --command cargo test
+
+  replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+      - run: nix develop --command cargo run --bin mangochill-replay -- --input notebook/files/mouse-sample.ndjson
+
+  replay-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/nix
+      - run: cd notebook && devenv shell uv run python replay.py -i files/mouse-sample.ndjson
