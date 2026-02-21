@@ -181,10 +181,12 @@ mod tests {
 
     const MIN: f64 = 30.0;
     const MAX: f64 = 144.0;
+    #[allow(unused)]
     const TICK: i64 = 1000; // 1ms ticks (1kHz)
 
     /// Simulate a tick loop: feed events that fall within each tick interval,
     /// then call compute_fps. Ticks are at TICK, 2*TICK, ...
+    #[allow(unused)]
     fn simulate(
         ewm: &mut DeviceEwm,
         tick_us: i64,
@@ -210,6 +212,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn steady_state_convergence_125hz() {
         // Key property: with p10-based normalization, a low polling-rate device
         // (125Hz = 8000µs deltas) ramps to the same limit as a 1kHz device.
@@ -223,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(miri))]
     fn half_life_accuracy() {
         // Use 100ms HL so the 2ms in-rhythm grace period is negligible.
         let hl = 100_000.0;
