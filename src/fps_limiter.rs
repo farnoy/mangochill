@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use log::{info, warn};
 use std::collections::HashMap;
-use tokio::sync::Notify;
-use tokio::task::spawn_local;
+use tokio::sync::{Notify, broadcast};
+use tokio::task::{spawn_local, yield_now};
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 
@@ -21,18 +21,34 @@ struct FpsSubscriber {
     devices: HashMap<u16, DeviceEwm>,
 }
 
-#[derive(Default)]
 pub struct FpsSubscribers {
     map: HashMap<u32, FpsSubscriber>,
+    late_poll_interrupt_tx: broadcast::Sender<()>,
+    late_poll_interrupt_rx: broadcast::Receiver<()>,
+}
+
+impl Default for FpsSubscribers {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FpsSubscribers {
     pub fn new() -> Self {
-        Self::default()
+        let (tx, rx) = broadcast::channel(8);
+        Self {
+            map: Default::default(),
+            late_poll_interrupt_tx: tx,
+            late_poll_interrupt_rx: rx,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    pub fn interrupt_receiver(&self) -> broadcast::Receiver<()> {
+        self.late_poll_interrupt_rx.resubscribe()
     }
 }
 
@@ -106,7 +122,14 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
 
         let child_ct = self.ct.child_token();
         let subs = Rc::clone(&self.subscribers);
-        spawn_local(tick_loop(id, frequency_hz, subs, child_ct));
+        let late_poll_interrupt = self.subscribers.borrow().late_poll_interrupt_tx.clone();
+        spawn_local(tick_loop(
+            id,
+            frequency_hz,
+            subs,
+            child_ct,
+            late_poll_interrupt,
+        ));
 
         let disconnector = capnp_rpc::new_client(Disconnector {
             id,
@@ -127,6 +150,7 @@ async fn tick_loop(
     frequency_hz: u16,
     subscribers: Rc<RefCell<FpsSubscribers>>,
     ct: CancellationToken,
+    late_poll_sender: broadcast::Sender<()>,
 ) {
     let period = Duration::from_micros(1_000_000 / frequency_hz as u64);
     let mut ticker = interval(period);
@@ -135,6 +159,15 @@ async fn tick_loop(
     ct.run_until_cancelled(async {
         loop {
             ticker.tick().await;
+
+            late_poll_sender
+                .send(())
+                .expect("failed to send late poll request");
+
+            // TODO: confirm this gives them enough of an opportunity?
+            //       if they're waiting with a readable socket, there should be
+            //       no suspensions until after observe_batch
+            yield_now().await;
 
             let (fps, handle) = {
                 let mut subs = subscribers.borrow_mut();
