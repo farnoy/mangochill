@@ -121,26 +121,24 @@ impl DeviceEwm {
 
     pub fn compute_fps_detailed(&mut self, now_us: i64, min_fps: f64, max_fps: f64) -> FpsDetail {
         let events = self.pending_events;
-        let x = events as f64;
         self.pending_events = 0;
 
         let p10 = self.resolution.p10();
 
-        let min_detail = FpsDetail {
-            fps_limit: min_fps,
-            y: 0.0,
-            expected: 0.0,
-            p10,
-            events,
-        };
-
         if self.last_event_us == i64::MIN {
             self.last_tick_us = now_us;
-            return min_detail;
+            return FpsDetail {
+                fps_limit: min_fps,
+                y: 0.0,
+                expected: 0.0,
+                p10,
+                events,
+            };
         }
 
-        let dt = if self.last_tick_us != i64::MIN {
-            (now_us - self.last_tick_us).max(1) as f64
+        let prev_us = self.last_tick_us;
+        let dt = if prev_us != i64::MIN {
+            (now_us - prev_us).max(1) as f64
         } else {
             0.0
         };
@@ -149,16 +147,26 @@ impl DeviceEwm {
         let input_res = p10.unwrap_or(dt.max(1.0));
         let expected = dt / input_res;
 
-        let idle_us = (now_us - self.last_event_us) as f64;
-        let in_hold = idle_us <= input_res * 2.0;
-
         if dt > 0.0 {
-            if x > 0.0 || in_hold {
+            let transition = self.last_event_us + input_res as i64 * 2;
+
+            if now_us <= transition {
                 let alpha = 1.0 - (-LN_2 * dt / self.attack_hl_us).exp();
                 self.y += alpha * (1.0 - self.y);
-            } else {
+            } else if prev_us >= transition {
                 let alpha = 1.0 - (-LN_2 * dt / self.release_hl_us).exp();
                 self.y += alpha * (0.0 - self.y);
+            } else {
+                // Split the tick interval at the hold->idle transition so that
+                // the we are independent of tick frequency.
+                let attack_dt = transition - prev_us;
+                let release_dt = now_us - transition;
+
+                let a = 1.0 - (-LN_2 * attack_dt as f64 / self.attack_hl_us).exp();
+                self.y += a * (1.0 - self.y);
+
+                let r = 1.0 - (-LN_2 * release_dt as f64 / self.release_hl_us).exp();
+                self.y += r * (0.0 - self.y);
             }
         }
 
@@ -250,6 +258,39 @@ mod tests {
         assert_eq!(
             detail.events, 5,
             "stale leading timestamps should be skipped"
+        );
+    }
+
+    #[test]
+    fn split_tick_matches_separate_ticks() {
+        // A single tick spanning the hold->idle transition (split path) must
+        // produce the same y as two ticks landing exactly on each side.
+        let hl_a = 50_000.0;
+        let hl_r = 100_000.0;
+
+        // 20 events at 1kHz — enough for p10, short enough that y stays near 0.
+        // p10 = 1000µs
+        let events: Vec<i64> = (1..=20).map(|i| i * 1000).collect();
+
+        let mut a = DeviceEwm::new(hl_a, hl_r);
+        let mut b = DeviceEwm::new(hl_a, hl_r);
+
+        a.observe_batch(&events);
+        b.observe_batch(&events);
+        a.compute_fps(20_000, MIN, MAX);
+        b.compute_fps(20_000, MIN, MAX);
+
+        // one coarse tick spanning the transition (split path)
+        let da = a.compute_fps_detailed(30_000, MIN, MAX);
+
+        // EWM b: pure attack up to transition, then pure release to same endpoint
+        b.compute_fps(22_000, MIN, MAX);
+        let db = b.compute_fps_detailed(30_000, MIN, MAX);
+
+        assert!(
+            (da.y - db.y).abs() < 1e-10,
+            "split tick y={} != separate ticks y={}",
+            da.y, db.y
         );
     }
 }
