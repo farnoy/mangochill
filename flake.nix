@@ -30,16 +30,13 @@
         { system, ... }:
         let
           fenixPkgs = inputs.fenix.packages.${system};
-          nightlyToolchain = fenixPkgs.toolchainOf {
+          toolchainAttrs = {
             channel = "nightly";
-            date = "2025-10-31";
-            sha256 = "sha256-SqCt0WGZzKVpy2f6PPjLyfFsAs4wmjp3Jokaa/OdaNY=";
+            date = "2026-02-22";
+            sha256 = "sha256-viptHfVceErIpjvZQgo6i7CM3BjBlsH0r/nBKMEXP60=";
           };
-          wasmTarget = fenixPkgs.targets.wasm32-unknown-unknown.toolchainOf {
-            channel = "nightly";
-            date = "2025-10-31";
-            sha256 = "sha256-SqCt0WGZzKVpy2f6PPjLyfFsAs4wmjp3Jokaa/OdaNY=";
-          };
+          nightlyToolchain = fenixPkgs.toolchainOf toolchainAttrs;
+          wasmTarget = fenixPkgs.targets.wasm32-unknown-unknown.toolchainOf toolchainAttrs;
           rustToolchain = fenixPkgs.combine [
             nightlyToolchain.completeToolchain
             wasmTarget.rust-std
