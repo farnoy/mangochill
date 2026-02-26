@@ -212,13 +212,14 @@ async fn tick_loop(
     info!("tick loop {id} stopped");
 }
 
-pub fn feed_events(subscribers: &mut FpsSubscribers, device_id: u16, timestamps_us: &[i64]) {
+pub fn feed_events(subscribers: &mut FpsSubscribers, device_id: u16, timestamps_us: &[i64], is_held_in_abs: bool) {
     for sub in subscribers.map.values_mut() {
         let ewm = sub
             .devices
             .entry(device_id)
             .or_insert_with(|| DeviceEwm::new(sub.attack_hl_us, sub.release_hl_us));
         ewm.observe_batch(timestamps_us);
+        ewm.held_in_abs(is_held_in_abs);
     }
 }
 
