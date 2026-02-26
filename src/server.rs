@@ -1,26 +1,27 @@
 use capnp_rpc::RpcSystem;
-use futures::FutureExt;
+use futures::future::{Either, select};
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
+    hint::select_unpredictable,
     io::{self, Read},
     os::{
         fd::{AsFd, AsRawFd},
         unix::fs::{OpenOptionsExt, PermissionsExt},
     },
     path::PathBuf,
+    pin::pin,
     rc::Rc,
-    task::{Poll, ready},
     time::Duration,
 };
 use tokio::{
     fs::remove_file,
-    io::{AsyncRead, AsyncReadExt, unix::AsyncFd},
+    io::{Interest, unix::AsyncFd},
     join,
     net::UnixListener,
     sync::Notify,
     task::{LocalSet, spawn_local},
-    time::MissedTickBehavior,
+    time::{Interval, MissedTickBehavior, interval},
 };
 use tokio_stream::{StreamExt, wrappers::UnixListenerStream};
 use tokio_util::{
@@ -31,7 +32,7 @@ use tokio_util::{
 
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
-use log::{debug, info, warn};
+use log::{debug, error, info, trace, warn};
 
 use mangochill::{
     bootstrap::MangoChillImpl,
@@ -319,6 +320,7 @@ async fn evdev_supervisor(
                         raw_subscribers.clone(),
                         device_ct.child_token(),
                         Rc::clone(&tracked),
+                        Scratch::new(),
                     ));
                 }
             }
@@ -348,6 +350,7 @@ async fn watch_device(
     raw_subscribers: Rc<RefCell<RawSubscribers>>,
     ct: CancellationToken,
     tracked: Rc<RefCell<HashSet<PathBuf>>>,
+    scratch: Rc<RefCell<Scratch>>,
 ) {
     info!("watching {:?} as device {device_id}", path.to_str());
     let file = match std::fs::OpenOptions::new()
@@ -369,113 +372,421 @@ async fn watch_device(
         warn!("EVIOCSCLOCKID failed on {path:?}: {e}");
     }
 
-    let mut file = AsyncCharDev::new(file).unwrap();
-    let mut buf = [0u8; size_of::<libc::input_event>() * 64];
-    let mut timestamps_us: Vec<i64> = Vec::new();
-    let cancellation = ct.cancelled_owned().fuse();
-    tokio::pin!(cancellation);
-
-    loop {
-        let read;
-        timestamps_us.clear();
-        tokio::select! {
-            biased;
-            _ = &mut cancellation => {
-                info!("cancelled device {fd}");
-                break;
-            }
-            res = file.read(&mut buf).fuse() => {
-                match res {
-                    Ok(n) => {
-                        read = n;
-                        debug!("read {read}");
+    let mut file = AsyncFd::with_interest(file, Interest::READABLE).unwrap();
+    let res: Option<io::Result<()>> = ct
+        .run_until_cancelled_owned(async {
+            // The debouncer delays our reads from the chardev after it first becomes readable.
+            // It also interacts with the late polling feature
+            let mut debouncer = Debounce::new(Duration::from_millis(1));
+            let mut ready_guard = file.ready_mut(Interest::READABLE).await?;
+            let mut is_ready = false;
+            let mut was_interrupted = false;
+            loop {
+                if is_ready {
+                    // TODO: verify if this is helpful at all
+                    info!("repeating read immediately");
+                    // yield_now().await;
+                } else {
+                    ready_guard = file.ready_mut(Interest::READABLE).await?;
+                    debouncer.restart();
+                    is_ready = true;
+                    was_interrupted = false;
+                    let mut rx = fps_subscribers.borrow().interrupt_receiver();
+                    let res = debouncer.tick(rx.recv()).await;
+                    match res {
+                        DebounceResult::SleepCompleted => trace!("successfully slept"),
+                        DebounceResult::Interrupted(Ok(())) => {
+                            was_interrupted = true;
+                            trace!("got interrupted")
+                        }
+                        DebounceResult::Interrupted(Err(e)) => {
+                            error!("error waiting for interrupt receiver: {e}")
+                        }
                     }
-                    Err(e) => {
+                }
+                debug_assert!(
+                    ready_guard.ready().is_readable(),
+                    "I don't understand tokio"
+                );
+
+                let x = ready_guard.try_io(|f| {
+                    // NOTE: we will reborrow after, important not to suspend until then
+                    trace!("read in async_io");
+                    let mut scratch = scratch.borrow_mut();
+                    unsafe { f.get_mut().read(scratch.read_buffer_mut()) }
+                });
+
+                let read = match x {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) => {
                         warn!("device {device_id} (fd {fd}) read error: {e}");
                         break;
                     }
-                }
-            }
-        };
-        let aligned = unsafe {
-            let (l, m, r) = buf[..read].align_to::<libc::input_event>();
-            assert!(
-                l.is_empty() && r.is_empty(),
-                "could not align read input event to the C struct"
-            );
-            debug!("have: {} events", m.len());
-            m
-        };
-
-        timestamps_us.reserve(aligned.len());
-        let mut prev = i64::MIN;
-        for ev in aligned {
-            let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
-            if ts_us != prev {
-                timestamps_us.push(ts_us);
-            }
-            prev = ts_us;
-        }
-
-        feed_events(&mut fps_subscribers.borrow_mut(), device_id, &timestamps_us);
-
-        if !raw_subscribers.borrow().map.is_empty() {
-            let now_us = monotonic_us();
-            for sub in raw_subscribers.borrow().map.values() {
-                let id = sub.id;
-                let mut req = sub.handle.receive_request();
-                let mut ts = req.get().init_collected_at();
-                ts.set_seconds(now_us / 1_000_000);
-                ts.set_microseconds((now_us % 1_000_000) as u32);
-                let count = u32::try_from(aligned.len()).unwrap();
-                let mut readings = req.get().init_readings(count);
-                for (ix, ev) in aligned.iter().enumerate() {
-                    let mut r = readings.reborrow().get(u32::try_from(ix).unwrap());
-                    r.set_seconds(ev.time.tv_sec);
-                    r.set_microseconds(ev.time.tv_usec as u32);
-                }
-                spawn_local(async move {
-                    if let Err(e) = req.send().promise.await {
-                        warn!("Error sending to raw subscriber {id} - {e:?}");
+                    Err(_would_block) => {
+                        is_ready = false;
+                        continue;
                     }
-                });
+                };
+                let mut scratch = scratch.borrow_mut();
+                let read_full = read == scratch.read_buffer_len();
+                debug!(
+                    "read {read}, full={read_full} because scratch len={}",
+                    scratch.read_buffer_len()
+                );
+                let mut prev = i64::MIN;
+                let mut overflowed = false;
+                let timestamps = unsafe {
+                    scratch.process(read, |ev| {
+                        let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
+                        let result = (ts_us != prev, ts_us);
+                        overflowed |= ev.type_ == 0 && ev.code == 3;
+                        prev = ts_us;
+                        result
+                    })
+                };
+
+                if overflowed {
+                    warn!("OVERFLOWED");
+                    debouncer.shrink();
+                } else if !read_full && !was_interrupted {
+                    debouncer.expand();
+                }
+
+                feed_events(&mut fps_subscribers.borrow_mut(), device_id, timestamps);
+
+                if !raw_subscribers.borrow().map.is_empty() {
+                    let now_us = monotonic_us();
+                    for sub in raw_subscribers.borrow().map.values() {
+                        let id = sub.id;
+                        let mut req = sub.handle.receive_request();
+                        let mut ts = req.get().init_collected_at();
+                        ts.set_seconds(now_us / 1_000_000);
+                        ts.set_microseconds((now_us % 1_000_000) as u32);
+                        let count = u32::try_from(timestamps.len()).unwrap();
+                        let mut readings = req.get().init_readings(count);
+                        for (ix, ts) in timestamps.iter().enumerate() {
+                            let mut r = readings.reborrow().get(u32::try_from(ix).unwrap());
+                            r.set_seconds(ts / 1_000_000);
+                            r.set_microseconds((ts % 1_000_000) as u32);
+                        }
+                        spawn_local(async move {
+                            if let Err(e) = req.send().promise.await {
+                                warn!("Error sending to raw subscriber {id} - {e:?}");
+                            }
+                        });
+                    }
+                }
             }
-        }
+
+            Ok(())
+        })
+        .await;
+
+    match res {
+        Some(Ok(())) => {}
+        Some(Err(e)) => warn!("Error in watch_device: {e}"),
+        None => info!("cancelled device {fd}"),
     }
 
     tracked.borrow_mut().remove(&path);
     info!("device {device_id} ({:?}) stopped", path);
 }
 
-struct AsyncCharDev {
-    inner: AsyncFd<std::fs::File>,
+// trailing-edge throttle
+struct Debounce {
+    interval: Interval,
+    ceiling: Duration,
 }
 
-impl AsyncCharDev {
-    fn new(file: std::fs::File) -> io::Result<Self> {
-        Ok(AsyncCharDev {
-            inner: AsyncFd::new(file)?,
-        })
+enum DebounceResult<T> {
+    SleepCompleted,
+    Interrupted(T),
+}
+
+impl Debounce {
+    fn new(d: Duration) -> Self {
+        let mut interval = interval(d);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        interval.reset();
+        Debounce {
+            interval,
+            ceiling: Duration::MAX,
+        }
+    }
+
+    async fn tick<F, R>(&mut self, fut: F) -> DebounceResult<R>
+    where
+        F: Future<Output = R>,
+    {
+        match select(pin!(self.interval.tick()), pin!(fut)).await {
+            Either::Left((_value, _)) => DebounceResult::SleepCompleted,
+            Either::Right((v, _)) => DebounceResult::Interrupted(v),
+        }
+    }
+
+    fn expand(&mut self) {
+        let period = self.interval.period();
+        let target = (period * 2).min(self.ceiling);
+        self.reset(target);
+    }
+
+    fn shrink(&mut self) {
+        let period = self.interval.period();
+        let target = period * 4 / 5;
+        self.ceiling = self.ceiling.min(target);
+        self.reset(target);
+    }
+
+    fn restart(&mut self) {
+        self.interval.reset_after(self.interval.period());
+    }
+
+    fn reset(&mut self, duration: Duration) {
+        if self.interval.period() == duration {
+            return;
+        }
+        self.interval = interval(duration);
+        info!("scaling feedback window to {:?}", duration);
+        self.interval
+            .set_missed_tick_behavior(MissedTickBehavior::Skip);
+        self.interval.reset();
     }
 }
 
-impl AsyncRead for AsyncCharDev {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.inner.poll_read_ready(cx))?;
-            let unfilled = buf.initialize_unfilled();
-            match guard.try_io(|inner| inner.get_ref().read(unfilled)) {
-                Ok(Ok(len)) => {
-                    buf.advance(len);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(err)) => return Poll::Ready(Err(err)),
-                Err(_would_block) => continue,
+struct Scratch {
+    read_buf: Vec<libc::input_event>,
+    timestamps_us: Vec<i64>,
+}
+
+const SCRATCH_INITIAL_SIZE: usize = if cfg!(test) { 1 } else { 32 };
+
+impl Scratch {
+    fn new() -> Rc<RefCell<Self>> {
+        let mut read_buf = Vec::with_capacity(SCRATCH_INITIAL_SIZE);
+        let mut timestamps_us = Vec::with_capacity(SCRATCH_INITIAL_SIZE);
+        unsafe {
+            read_buf.set_len(SCRATCH_INITIAL_SIZE);
+            timestamps_us.set_len(SCRATCH_INITIAL_SIZE);
+        }
+        dbg!(read_buf.as_ptr() as usize % 8);
+        dbg!(timestamps_us.as_ptr() as usize % 8);
+        let s = Self {
+            read_buf,
+            timestamps_us,
+        };
+        s.invariant();
+        Rc::new(RefCell::new(s))
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure that every element in the slice it reads has been
+    /// written to previously.
+    unsafe fn read_buffer_mut(&mut self) -> &mut [u8] {
+        self.invariant();
+        let (l, s, r) = unsafe { self.read_buf.align_to_mut::<u8>() };
+        // surely aligning to 1 byte is infallible?
+        // TODO: use hint::assert_unchecked() hints
+        assert!(l.is_empty() && r.is_empty());
+        &mut s[..]
+    }
+
+    fn read_buffer_len(&self) -> usize {
+        self.invariant();
+        self.read_buf.len() * size_of::<libc::input_event>()
+    }
+
+    /// # Safety
+    ///
+    /// The caller must ensure it's filled the `0..read` range of the read buffer before
+    /// calling this function.
+    unsafe fn record_read(&mut self, read: usize) {
+        self.invariant();
+        let elements = read / size_of::<libc::input_event>();
+        if elements == self.read_buf.len() {
+            let _cap = self.read_buf.capacity();
+            info!("scratch buffer filled, doubling to {}", elements * 2);
+            dbg!("doubling", elements);
+            self.read_buf.reserve(elements);
+            self.timestamps_us.reserve(elements);
+            unsafe {
+                let len = self.timestamps_us.len();
+                self.read_buf.set_len(len * 2);
+                let len_ts = self.timestamps_us.len();
+                self.timestamps_us.set_len(len_ts * 2);
             }
         }
+        self.invariant();
+    }
+
+    fn invariant(&self) {
+        debug_assert_eq!(self.read_buf.len(), self.timestamps_us.len());
+    }
+
+    /// # Safety
+    ///
+    /// See [record_read] for the `read` parameter.
+    #[inline]
+    unsafe fn process<F>(&mut self, read: usize, mut f: F) -> &[i64]
+    where
+        F: FnMut(&libc::input_event) -> (bool, i64),
+    {
+        unsafe { self.record_read(read) };
+        assert!(read.is_multiple_of(size_of::<libc::input_event>()));
+        let aligned = unsafe {
+            let (l, m, r) = self.read_buf[..read / size_of::<libc::input_event>()]
+                .align_to::<libc::input_event>();
+            assert!(
+                l.is_empty() && r.is_empty(),
+                "could not align read input event to the C struct"
+            );
+            m
+        };
+
+        let count = {
+            let mut ix = 0;
+            for ev in aligned {
+                let (cond, val) = f(ev);
+                // TODO: capture a sizeable buffer of raw input_events, then test branch
+                //       prediction to see if this is even worth it compared to
+                //       if cond { .push(val) }
+                unsafe {
+                    let b = self.timestamps_us.get_unchecked_mut(ix);
+                    *b = val;
+                }
+                ix += select_unpredictable(cond, 1, 0);
+            }
+            ix
+        };
+        self.invariant();
+
+        &self.timestamps_us[..count]
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::Scratch;
+
+    fn input_event(ts: i64) -> Vec<u8> {
+        let ev = libc::input_event {
+            time: libc::timeval {
+                tv_sec: ts / 1_000_000,
+                tv_usec: ts % 1_000_000,
+            },
+            type_: 0,
+            code: 0,
+            value: 0,
+        };
+        let v = vec![ev];
+        let (left, middle, right) = unsafe { v.align_to::<u8>() };
+        assert!(left.is_empty() && right.is_empty());
+        middle.iter().copied().collect()
+    }
+
+    #[test]
+    fn scratch_full_flow() {
+        let scratch = Scratch::new();
+        let mut scratch = scratch.borrow_mut();
+        let mut evdev = vec![];
+        evdev.extend(input_event(1234));
+        evdev.extend(input_event(1234));
+        evdev.extend(input_event(1235));
+        evdev.extend(input_event(9999));
+        evdev.extend(input_event(9998));
+        unsafe {
+            let mut ix = 0;
+            dbg!(scratch.read_buf.len());
+            dbg!(scratch.read_buf.capacity());
+            dbg!(scratch.timestamps_us.len());
+            dbg!(scratch.timestamps_us.capacity());
+            scratch.read_buffer_mut()[..24].copy_from_slice(&evdev[..24]);
+            let ts = scratch.process(24, |ts| {
+                assert_eq!(1234, ts.time.tv_usec, "{ix}");
+                ix += 1;
+                (true, ix * 100)
+            });
+            assert_eq!(1, ix);
+            assert_eq!(ts, &[100]);
+            dbg!(scratch.read_buf.len());
+            dbg!(scratch.read_buf.capacity());
+            dbg!(scratch.timestamps_us.len());
+            dbg!(scratch.timestamps_us.capacity());
+            scratch.read_buffer_mut()[..48].copy_from_slice(&evdev[24..72]);
+            let ts = scratch.process(48, |ts| {
+                assert_eq!(if ix == 1 { 1234 } else { 1235 }, ts.time.tv_usec, "{ix}");
+                ix += 1;
+                (ix == 3, ix * 10)
+            });
+            assert_eq!(3, ix);
+            assert_eq!(ts, &[30]);
+            scratch.read_buffer_mut()[..48].copy_from_slice(&evdev[72..][..2 * 24]);
+            let ts = scratch.process(48, |ts| {
+                assert_eq!(if ix == 3 { 9999 } else { 9998 }, ts.time.tv_usec, "{ix}");
+                ix += 1;
+                (ix == 4, ts.time.tv_usec)
+            });
+            assert_eq!(5, ix);
+            assert_eq!(ts, &[9999]);
+        };
+        assert_eq!(1, 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn torn_read() {
+        let scratch = Scratch::new();
+        let mut scratch = scratch.borrow_mut();
+        let mut evdev = vec![];
+        evdev.extend(input_event(1234));
+        // input_event is 24 B, let's cut off at 15
+        unsafe {
+            scratch.read_buffer_mut()[..15].copy_from_slice(&evdev[..15]);
+            scratch.process(15, |_| (false, 0))
+        };
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[cfg(not(miri))]
+    // sanity check
+    async fn test_debounce() {
+        use std::{
+            cell::{Cell, RefCell},
+            rc::Rc,
+            time::Duration,
+        };
+        use tokio::{
+            task::{LocalSet, spawn_local},
+            time::Instant,
+            time::sleep,
+        };
+
+        let timer = Rc::new(RefCell::new(Box::pin(sleep(Duration::from_secs(10)))));
+
+        let set = LocalSet::new();
+        let _guard = set.enter();
+
+        let completed = Rc::new(Cell::new(false));
+
+        spawn_local({
+            let timer = timer.clone();
+            let completed = completed.clone();
+            async move {
+                dbg!("in s start");
+                timer.borrow_mut().as_mut().await;
+                dbg!("in s setting completed");
+                completed.set(true);
+            }
+        });
+        assert!(!completed.get());
+
+        set.run_until(async move {
+            assert!(!completed.get());
+            timer.borrow_mut().as_mut().reset(Instant::now());
+            assert!(!completed.get());
+            sleep(Duration::from_millis(1)).await;
+            assert!(completed.get());
+        })
+        .await;
     }
 }
