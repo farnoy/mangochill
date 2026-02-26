@@ -1,5 +1,6 @@
 use capnp_rpc::RpcSystem;
 use futures::future::{Either, select};
+use nix::request_code_read;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
@@ -75,6 +76,13 @@ struct RawServerImpl {
 struct RawSubscriber {
     id: u32,
     handle: mangochill_capnp::poll_receiver::Client,
+}
+
+#[derive(Clone, Copy)]
+struct DeviceCapabilities {
+    is_pointer: bool,
+    is_accelerometer: bool,
+    has_abs: bool,
 }
 
 impl mangochill_capnp::raw_events::Server for RawServerImpl {
@@ -283,21 +291,18 @@ async fn serve(
 }
 
 fn discover_mouse_devices() -> Vec<PathBuf> {
-    let dir = match std::fs::read_dir("/dev/input/by-id") {
+    let dir = match std::fs::read_dir("/dev/input") {
         Ok(d) => d,
         Err(e) => {
-            warn!("cannot read /dev/input/by-id: {e}");
+            warn!("cannot read /dev/input: {e}");
             return Vec::new();
         }
     };
     let mut paths = Vec::new();
     for entry in dir.flatten() {
         let name = entry.file_name();
-        if name.as_encoded_bytes().ends_with(b"-event-mouse") {
-            match std::fs::canonicalize(entry.path()) {
-                Ok(p) => paths.push(p),
-                Err(e) => warn!("canonicalize {:?}: {e}", entry.path()),
-            }
+        if name.as_encoded_bytes().starts_with(b"event") {
+            paths.push(entry.path());
         }
     }
     paths
@@ -393,6 +398,104 @@ async fn watch_device(
     nix::ioctl_write_ptr!(eviocsclockid, b'E', 0xa0, libc::c_int);
     if let Err(e) = unsafe { eviocsclockid(fd, &libc::CLOCK_MONOTONIC) } {
         warn!("EVIOCSCLOCKID failed on {path:?}: {e}");
+        return;
+    }
+
+    nix::ioctl_read_buf!(eviocgprop, b'E', 0x09, libc::c_uchar);
+    let input_prop_pointer =
+        u8::try_from(libc::INPUT_PROP_POINTER).expect("INPUT_PROP_POINTER must fit into u8");
+    let input_prop_accelerometer = u8::try_from(libc::INPUT_PROP_ACCELEROMETER)
+        .expect("INPUT_PROP_ACCELEROMETER must fit into u8");
+    let mut properties = [0u8; 1];
+    if let Err(e) = unsafe { eviocgprop(fd, &mut properties) } {
+        warn!("EVIOCGPROP failed on {path:?}: {e}");
+        return;
+    }
+    let is_pointer = properties[0] & (1u8 << input_prop_pointer) != 0;
+    let is_accelerometer = properties[0] & (1u8 << input_prop_accelerometer) != 0;
+    let has_abs = {
+        let ev_max = usize::from(libc::EV_MAX);
+        let event_bits_len = (ev_max + 8) / 8;
+        let mut event_bits = vec![0u8; event_bits_len];
+        let req = request_code_read!(b'E', 0x20, event_bits_len);
+        match unsafe { nix::errno::Errno::result(libc::ioctl(fd, req, event_bits.as_mut_ptr())) } {
+            Ok(_) => {
+                let ev_abs = 3;
+                event_bits
+                    .get(ev_abs / 8)
+                    .is_some_and(|byte| byte & (1 << (ev_abs % 8)) != 0)
+            }
+            Err(e) => {
+                warn!("EVIOCGBIT failed on {path:?}: {e}; assuming EV_ABS support");
+                true
+            }
+        }
+    };
+    let caps = DeviceCapabilities {
+        is_pointer,
+        is_accelerometer,
+        has_abs,
+    };
+    if caps.is_accelerometer {
+        info!("ignoring accelerometer device {path:?}");
+        // TODO: should keep it open so we know when it disappears & them remove.
+        //       currently, if sth else was plugged into this eventN slot,
+        //       we would keep ignoring it?
+        return;
+    }
+
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    #[derive(Default, Clone, Copy, Debug)]
+    struct input_absinfo {
+        value: i32,
+        minimum: i32,
+        maximum: i32,
+        fuzz: i32,
+        flat: i32,
+        resolution: i32,
+    }
+    let mut absinfo = [input_absinfo::default(); 64];
+    let mut gabs = |i: usize| unsafe {
+        nix::errno::Errno::result(libc::ioctl(
+            fd,
+            request_code_read!(b'E', 0x40 + i, size_of::<input_absinfo>()),
+            &mut absinfo[i..],
+        ))
+    };
+    for i in 0..AXIS_COUNT {
+        if let Err(e) = gabs(i) {
+            warn!("EVIOCGABS failed on {path:?}: {e}");
+            break;
+        }
+    }
+    const AXIS_COUNT: usize = libc::ABS_CNT;
+    #[cfg(feature = "branchless")]
+    // let's pad this to have room to safely dump unconditional writes
+    const LAST_VALUES_COUNT: usize = AXIS_COUNT + 1;
+    #[cfg(not(feature = "branchless"))]
+    const LAST_VALUES_COUNT: usize = AXIS_COUNT;
+
+    // TODO: do the same for keyboards, held buttons
+    struct Axes {
+        // doesn't need to be precisely synced up. we can tolerate
+        // skipped/inconsistent values after SYN_DROPPED
+        last_values: [i32; LAST_VALUES_COUNT],
+        midpoints: [i32; AXIS_COUNT],
+        deadzones: [u32; AXIS_COUNT],
+    }
+    let mut axes = Axes {
+        last_values: [i32::MIN; LAST_VALUES_COUNT],
+        midpoints: [0; AXIS_COUNT],
+        deadzones: [0; AXIS_COUNT],
+    };
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..AXIS_COUNT {
+        let span = absinfo[i].maximum - absinfo[i].minimum;
+        let midpoint = absinfo[i].minimum + span / 2;
+        let deadzone = span / 10;
+        axes.midpoints[i] = midpoint;
+        axes.deadzones[i] = u32::try_from(deadzone).expect("I don't understand numbers");
     }
 
     let mut file = AsyncFd::with_interest(file, Interest::READABLE).unwrap();
@@ -476,12 +579,32 @@ async fn watch_device(
                         let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
                         let is_ev_syn = ev.type_ == 0;
                         // let is_ev_rel = ev.type_ == 2;
-                        // let is_ev_abs = ev.type_ == 3;
+                        let is_ev_abs = ev.type_ == 3;
+                        let abs_id = ev.code % 64;
+                        // let abs_last = axes.last_values[abs_id as usize];
+                        let abs_midpoint = axes.midpoints[abs_id as usize];
+                        let abs_deadzone = axes.deadzones[abs_id as usize];
 
                         let mut keep = if cfg!(feature = "branchless") {
-                            hint::select_unpredictable(is_ev_syn, false, true)
+                            axes.last_values[hint::select_unpredictable(
+                                is_ev_syn,
+                                abs_id as usize,
+                                LAST_VALUES_COUNT - 1,
+                            )] = ev.value;
+                            hint::select_unpredictable(
+                                is_ev_syn,
+                                false,
+                                hint::select_unpredictable(
+                                    is_ev_abs,
+                                    ev.value.abs_diff(abs_midpoint) >= abs_deadzone,
+                                    true,
+                                ),
+                            )
                         } else if is_ev_syn {
                             false
+                        } else if is_ev_abs {
+                            axes.last_values[abs_id as usize] = ev.value;
+                            ev.value.abs_diff(abs_midpoint) >= abs_deadzone
                         } else {
                             true
                         };
@@ -510,7 +633,19 @@ async fn watch_device(
                 );
                 let _g = s.enter();
 
-                feed_events(&mut fps_subscribers.borrow_mut(), device_id, timestamps);
+                let is_held_in_abs = !is_pointer
+                    && (0..AXIS_COUNT).any(|ix| {
+                        axes.last_values[ix] != i32::MIN
+                            && axes.last_values[ix].abs_diff(axes.midpoints[ix])
+                                >= axes.deadzones[ix]
+                    });
+
+                feed_events(
+                    &mut fps_subscribers.borrow_mut(),
+                    device_id,
+                    timestamps,
+                    is_held_in_abs,
+                );
 
                 if !raw_subscribers.borrow().map.is_empty() {
                     let now_us = monotonic_us();
