@@ -89,7 +89,7 @@ pub struct DeviceEwm {
     last_tick_us: i64,
     last_event_us: i64,
     resolution: ResolutionEstimator,
-    held_in_abs: bool,
+    active_indefinitely: bool,
 }
 
 impl DeviceEwm {
@@ -102,7 +102,7 @@ impl DeviceEwm {
             last_tick_us: i64::MIN,
             last_event_us: i64::MIN,
             resolution: ResolutionEstimator::new(),
-            held_in_abs: false,
+            active_indefinitely: false,
         }
     }
 
@@ -116,8 +116,8 @@ impl DeviceEwm {
         }
     }
 
-    pub fn held_in_abs(&mut self, is_held: bool) {
-        self.held_in_abs = is_held;
+    pub fn active_indefinitely(&mut self, is_active: bool) {
+        self.active_indefinitely = is_active;
     }
 
     pub fn compute_fps(&mut self, now_us: i64, min_fps: f64, max_fps: f64) -> f64 {
@@ -156,7 +156,7 @@ impl DeviceEwm {
         if dt > 0.0 {
             let transition = self.last_event_us + input_res as i64 * 2;
 
-            if now_us <= transition || self.held_in_abs {
+            if now_us <= transition || self.active_indefinitely {
                 let alpha = 1.0 - (-LN_2 * dt / self.attack_hl_us).exp();
                 self.y += alpha * (1.0 - self.y);
             } else if prev_us >= transition {

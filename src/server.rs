@@ -4,8 +4,8 @@ use nix::request_code_read;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    hint,
     io::{self, Read},
+    mem::size_of,
     os::{
         fd::{AsFd, AsRawFd},
         unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -39,6 +39,7 @@ use log::{debug, error, info, trace, warn};
 use mangochill::{
     bootstrap::MangoChillImpl,
     fps_limiter::{FpsLimiterImpl, FpsSubscribers, feed_events},
+    input_parsing::{self, AXIS_COUNT, Axes, DeviceCapabilities},
     mangochill_capnp::{
         self,
         raw_events::{RegisterParams, RegisterResults},
@@ -76,13 +77,6 @@ struct RawServerImpl {
 struct RawSubscriber {
     id: u32,
     handle: mangochill_capnp::poll_receiver::Client,
-}
-
-#[derive(Clone, Copy)]
-struct DeviceCapabilities {
-    is_pointer: bool,
-    is_accelerometer: bool,
-    has_abs: bool,
 }
 
 impl mangochill_capnp::raw_events::Server for RawServerImpl {
@@ -444,236 +438,63 @@ async fn watch_device(
         return;
     }
 
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    #[derive(Default, Clone, Copy, Debug)]
-    struct input_absinfo {
-        value: i32,
-        minimum: i32,
-        maximum: i32,
-        fuzz: i32,
-        flat: i32,
-        resolution: i32,
-    }
-    let mut absinfo = [input_absinfo::default(); 64];
-    let mut gabs = |i: usize| unsafe {
-        nix::errno::Errno::result(libc::ioctl(
-            fd,
-            request_code_read!(b'E', 0x40 + i, size_of::<input_absinfo>()),
-            &mut absinfo[i..],
-        ))
-    };
-    for i in 0..AXIS_COUNT {
-        if let Err(e) = gabs(i) {
-            warn!("EVIOCGABS failed on {path:?}: {e}");
-            break;
+    let file = AsyncFd::with_interest(file, Interest::READABLE).unwrap();
+    let res = if caps.has_abs {
+        #[repr(C)]
+        #[allow(non_camel_case_types)]
+        #[derive(Default, Clone, Copy, Debug)]
+        struct input_absinfo {
+            value: i32,
+            minimum: i32,
+            maximum: i32,
+            fuzz: i32,
+            flat: i32,
+            resolution: i32,
         }
-    }
-    const AXIS_COUNT: usize = libc::ABS_CNT;
-    #[cfg(feature = "branchless")]
-    // let's pad this to have room to safely dump unconditional writes
-    const LAST_VALUES_COUNT: usize = AXIS_COUNT + 1;
-    #[cfg(not(feature = "branchless"))]
-    const LAST_VALUES_COUNT: usize = AXIS_COUNT;
-
-    // TODO: do the same for keyboards, held buttons
-    struct Axes {
-        // doesn't need to be precisely synced up. we can tolerate
-        // skipped/inconsistent values after SYN_DROPPED
-        last_values: [i32; LAST_VALUES_COUNT],
-        midpoints: [i32; AXIS_COUNT],
-        deadzones: [u32; AXIS_COUNT],
-    }
-    let mut axes = Axes {
-        last_values: [i32::MIN; LAST_VALUES_COUNT],
-        midpoints: [0; AXIS_COUNT],
-        deadzones: [0; AXIS_COUNT],
-    };
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..AXIS_COUNT {
-        let span = absinfo[i].maximum - absinfo[i].minimum;
-        let midpoint = absinfo[i].minimum + span / 2;
-        let deadzone = span / 10;
-        axes.midpoints[i] = midpoint;
-        axes.deadzones[i] = u32::try_from(deadzone).expect("I don't understand numbers");
-    }
-
-    let mut file = AsyncFd::with_interest(file, Interest::READABLE).unwrap();
-    let res: Option<io::Result<()>> = ct
-        .run_until_cancelled_owned(async {
-            // The debouncer delays our reads from the chardev after it first becomes readable.
-            // It also interacts with the late polling feature
-            let mut debouncer = Debounce::new(Duration::from_millis(1));
-            let mut ready_guard = file.ready_mut(Interest::READABLE).await?;
-            let mut is_ready = false;
-            let mut was_interrupted = false;
-            loop {
-                let prolog_was_ready = is_ready;
-                let prolog_was_interrupted = was_interrupted;
-
-                if is_ready {
-                    trace!("repeating read immediately");
-                } else {
-                    ready_guard = file.ready_mut(Interest::READABLE).await?;
-                    debouncer.restart();
-                    is_ready = true;
-                    was_interrupted = false;
-                    let mut rx = fps_subscribers.borrow().interrupt_receiver();
-                    let res = debouncer.tick(rx.recv()).await;
-                    match res {
-                        DebounceResult::SleepCompleted => trace!("successfully slept"),
-                        DebounceResult::Interrupted(Ok(())) => {
-                            was_interrupted = true;
-                            trace!("got interrupted")
-                        }
-                        DebounceResult::Interrupted(Err(e)) => {
-                            error!("error waiting for interrupt receiver: {e}")
-                        }
-                    }
-                }
-                debug_assert!(
-                    ready_guard.ready().is_readable(),
-                    "I don't understand tokio"
-                );
-                let s = trace_span!(
-                    "watch_device::read_io",
-                    device_id,
-                    prolog_was_ready,
-                    is_ready,
-                    prolog_was_interrupted,
-                    was_interrupted,
-                );
-                let _g = s.enter();
-
-                let x = ready_guard.try_io(|f| {
-                    // NOTE: we will reborrow after, important not to suspend until then
-                    trace!("read in async_io");
-                    let mut scratch = scratch.borrow_mut();
-                    unsafe { f.get_mut().read(scratch.read_buffer_mut()) }
-                });
-
-                let read = match x {
-                    Ok(Ok(n)) => n,
-                    Ok(Err(e)) => {
-                        warn!("device {device_id} (fd {fd}) read error: {e}");
-                        break;
-                    }
-                    Err(_would_block) => {
-                        is_ready = false;
-                        continue;
-                    }
-                };
-
-                let mut scratch = scratch.borrow_mut();
-                let read_full = read == scratch.read_buffer_len();
-                debug!(
-                    "read {read}, full={read_full} because scratch len={}",
-                    scratch.read_buffer_len()
-                );
-                let mut prev = i64::MIN;
-                let mut overflowed = false;
-                let timestamps = unsafe {
-                    let span = trace_span!("watch_device::process_loop", device_id);
-                    let _g = span.enter();
-                    scratch.process(read, |ev| {
-                        let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
-                        let is_ev_syn = ev.type_ == 0;
-                        // let is_ev_rel = ev.type_ == 2;
-                        let is_ev_abs = ev.type_ == 3;
-                        let abs_id = ev.code % 64;
-                        // let abs_last = axes.last_values[abs_id as usize];
-                        let abs_midpoint = axes.midpoints[abs_id as usize];
-                        let abs_deadzone = axes.deadzones[abs_id as usize];
-
-                        let mut keep = if cfg!(feature = "branchless") {
-                            axes.last_values[hint::select_unpredictable(
-                                is_ev_syn,
-                                abs_id as usize,
-                                LAST_VALUES_COUNT - 1,
-                            )] = ev.value;
-                            hint::select_unpredictable(
-                                is_ev_syn,
-                                false,
-                                hint::select_unpredictable(
-                                    is_ev_abs,
-                                    ev.value.abs_diff(abs_midpoint) >= abs_deadzone,
-                                    true,
-                                ),
-                            )
-                        } else if is_ev_syn {
-                            false
-                        } else if is_ev_abs {
-                            axes.last_values[abs_id as usize] = ev.value;
-                            ev.value.abs_diff(abs_midpoint) >= abs_deadzone
-                        } else {
-                            true
-                        };
-                        // dedup
-                        keep &= ts_us != prev;
-                        overflowed |= is_ev_syn && ev.code == 3; // SYN_DROPPED
-                        prev = ts_us;
-                        (keep, ts_us)
-                    })
-                };
-
-                if overflowed {
-                    warn!("OVERFLOWED");
-                    debouncer.shrink();
-                } else if !read_full && !was_interrupted {
-                    debouncer.expand();
-                }
-                let s = trace_span!(
-                    "watch_device::feed_events",
-                    path = path.to_str().unwrap(),
-                    device_id,
-                    read_bytes = read,
-                    filled_scratch = read_full,
-                    overflowed,
-                    compacted = timestamps.len()
-                );
-                let _g = s.enter();
-
-                let is_held_in_abs = !is_pointer
-                    && (0..AXIS_COUNT).any(|ix| {
-                        axes.last_values[ix] != i32::MIN
-                            && axes.last_values[ix].abs_diff(axes.midpoints[ix])
-                                >= axes.deadzones[ix]
-                    });
-
-                feed_events(
-                    &mut fps_subscribers.borrow_mut(),
-                    device_id,
-                    timestamps,
-                    is_held_in_abs,
-                );
-
-                if !raw_subscribers.borrow().map.is_empty() {
-                    let now_us = monotonic_us();
-                    for sub in raw_subscribers.borrow().map.values() {
-                        let id = sub.id;
-                        let mut req = sub.handle.receive_request();
-                        let mut ts = req.get().init_collected_at();
-                        ts.set_seconds(now_us / 1_000_000);
-                        ts.set_microseconds((now_us % 1_000_000) as u32);
-                        let count = u32::try_from(timestamps.len()).unwrap();
-                        let mut readings = req.get().init_readings(count);
-                        for (ix, ts) in timestamps.iter().enumerate() {
-                            let mut r = readings.reborrow().get(u32::try_from(ix).unwrap());
-                            r.set_seconds(ts / 1_000_000);
-                            r.set_microseconds((ts % 1_000_000) as u32);
-                        }
-                        spawn_local(async move {
-                            if let Err(e) = req.send().promise.await {
-                                warn!("Error sending to raw subscriber {id} - {e:?}");
-                            }
-                        });
-                    }
-                }
+        let mut absinfo = [input_absinfo::default(); AXIS_COUNT];
+        let mut gabs = |i: usize| unsafe {
+            nix::errno::Errno::result(libc::ioctl(
+                fd,
+                request_code_read!(b'E', 0x40 + i, size_of::<input_absinfo>()),
+                &mut absinfo[i..],
+            ))
+        };
+        for i in 0..AXIS_COUNT {
+            if let Err(e) = gabs(i) {
+                warn!("EVIOCGABS failed on {path:?}: {e}");
+                break;
             }
+        }
+        let mut min_max = [(0i32, 0i32); AXIS_COUNT];
+        for i in 0..AXIS_COUNT {
+            min_max[i] = (absinfo[i].minimum, absinfo[i].maximum);
+        }
+        let axes = Axes::from_min_max(&min_max);
 
-            Ok(())
-        })
-        .await;
+        ct.run_until_cancelled_owned(watch_device_loop::<true>(
+            path.clone(),
+            device_id,
+            fd,
+            file,
+            fps_subscribers,
+            raw_subscribers,
+            scratch,
+            (axes, caps.is_pointer),
+        ))
+        .await
+    } else {
+        ct.run_until_cancelled_owned(watch_device_loop::<false>(
+            path.clone(),
+            device_id,
+            fd,
+            file,
+            fps_subscribers,
+            raw_subscribers,
+            scratch,
+            (),
+        ))
+        .await
+    };
 
     match res {
         Some(Ok(())) => {}
@@ -683,6 +504,151 @@ async fn watch_device(
 
     tracked.borrow_mut().remove(&path);
     info!("device {device_id} ({:?}) stopped", path);
+}
+
+async fn watch_device_loop<const HAS_ABS: bool>(
+    path: PathBuf,
+    device_id: u16,
+    fd: i32,
+    mut file: AsyncFd<std::fs::File>,
+    fps_subscribers: Rc<RefCell<FpsSubscribers>>,
+    raw_subscribers: Rc<RefCell<RawSubscribers>>,
+    scratch: Rc<RefCell<Scratch>>,
+    mut state: <input_parsing::Processor as input_parsing::ProcessorState<HAS_ABS>>::State,
+) -> io::Result<()>
+where
+    input_parsing::Processor: input_parsing::ProcessorState<HAS_ABS>,
+{
+    // The debouncer delays our reads from the chardev after it first becomes readable.
+    // It also interacts with the late polling feature
+    let mut debouncer = Debounce::new(Duration::from_millis(1));
+    let mut ready_guard = file.ready_mut(Interest::READABLE).await?;
+    let mut is_ready = false;
+    let mut was_interrupted = false;
+    loop {
+        let prolog_was_ready = is_ready;
+        let prolog_was_interrupted = was_interrupted;
+
+        if is_ready {
+            trace!("repeating read immediately");
+        } else {
+            ready_guard = file.ready_mut(Interest::READABLE).await?;
+            debouncer.restart();
+            is_ready = true;
+            was_interrupted = false;
+            let mut rx = fps_subscribers.borrow().interrupt_receiver();
+            let res = debouncer.tick(rx.recv()).await;
+            match res {
+                DebounceResult::SleepCompleted => trace!("successfully slept"),
+                DebounceResult::Interrupted(Ok(())) => {
+                    was_interrupted = true;
+                    trace!("got interrupted")
+                }
+                DebounceResult::Interrupted(Err(e)) => {
+                    error!("error waiting for interrupt receiver: {e}")
+                }
+            }
+        }
+        debug_assert!(
+            ready_guard.ready().is_readable(),
+            "I don't understand tokio"
+        );
+        let s = trace_span!(
+            "watch_device::read_io",
+            device_id,
+            prolog_was_ready,
+            is_ready,
+            prolog_was_interrupted,
+            was_interrupted,
+        );
+        let _g = s.enter();
+
+        let x = ready_guard.try_io(|f| {
+            // NOTE: we will reborrow after, important not to suspend until then
+            trace!("read in async_io");
+            let mut scratch = scratch.borrow_mut();
+            unsafe { f.get_mut().read(scratch.read_buffer_mut()) }
+        });
+
+        let read = match x {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                warn!("device {device_id} (fd {fd}) read error: {e}");
+                break;
+            }
+            Err(_would_block) => {
+                is_ready = false;
+                continue;
+            }
+        };
+
+        let mut scratch = scratch.borrow_mut();
+        let read_full = read == scratch.read_buffer_len();
+        debug!(
+            "read {read}, full={read_full} because scratch len={}",
+            scratch.read_buffer_len()
+        );
+        let outcome = {
+            let span = trace_span!("watch_device::process_loop", device_id);
+            let _g = span.enter();
+            unsafe {
+                <input_parsing::Processor as input_parsing::ProcessorState<HAS_ABS>>::process_batch(
+                    &mut scratch,
+                    read,
+                    &mut state,
+                )
+            }
+        };
+
+        if outcome.overflowed {
+            warn!("OVERFLOWED");
+            debouncer.shrink();
+        } else if !read_full && !was_interrupted {
+            debouncer.expand();
+        }
+        let s = trace_span!(
+            "watch_device::feed_events",
+            path = path.to_str().unwrap(),
+            device_id,
+            read_bytes = read,
+            filled_scratch = read_full,
+            overflowed = outcome.overflowed,
+            compacted = outcome.timestamps_us.len()
+        );
+        let _g = s.enter();
+
+        feed_events(
+            &mut fps_subscribers.borrow_mut(),
+            device_id,
+            outcome.timestamps_us,
+            outcome.is_active_indefinitely,
+        );
+
+        if !raw_subscribers.borrow().map.is_empty() {
+            let now_us = monotonic_us();
+            for sub in raw_subscribers.borrow().map.values() {
+                let id = sub.id;
+                let mut req = sub.handle.receive_request();
+                let mut ts = req.get().init_collected_at();
+                ts.set_seconds(now_us / 1_000_000);
+                ts.set_microseconds((now_us % 1_000_000) as u32);
+                let count = u32::try_from(outcome.timestamps_us.len()).unwrap();
+                let mut readings = req.get().init_readings(count);
+                for (ix, ts) in outcome.timestamps_us.iter().enumerate() {
+                    let mut r = readings.reborrow().get(u32::try_from(ix).unwrap());
+                    r.set_seconds(ts / 1_000_000);
+                    r.set_microseconds((ts % 1_000_000) as u32);
+                }
+                spawn_local(async move {
+                    if let Err(e) = req.send().promise.await {
+                        warn!("Error sending to raw subscriber {id} - {e:?}");
+                    }
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // trailing-edge throttle
