@@ -90,6 +90,7 @@ $ mangochill-client -vv --min-fps 10 --max-fps 60 --attack-half-life-ms 600 --re
 
 ## TODOs / Roadmap
 
-- [ ] Gamepad support
-- [ ] Keyboard support
+- [x] Gamepad support
+- [x] Keyboard support
 - [ ] Packaging for other distros
+- [ ] `EVIOCG*` re-synchronization after `SYN_DROPPED` - may or may not be necessary
