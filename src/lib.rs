@@ -25,6 +25,8 @@ pub mod bootstrap;
 pub mod ewm;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fps_limiter;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod scratch;
 
 #[cfg(all(not(target_arch = "wasm32"), not(miri)))]
 #[global_allocator]
