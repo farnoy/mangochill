@@ -10,11 +10,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/nix
-      - run: nix develop --command cargo clippy
+      - run: nix develop --quiet --command cargo --quiet clippy
 
   rustfmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/nix
-      - run: nix develop --command cargo fmt --check
+      - run: nix develop --quiet --command cargo --quiet fmt --check
