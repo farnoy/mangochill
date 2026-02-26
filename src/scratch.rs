@@ -29,6 +29,7 @@ impl Scratch {
     ///
     /// The caller must ensure that every element in the slice it reads has been
     /// written to previously.
+    #[inline]
     pub unsafe fn read_buffer_mut(&mut self) -> &mut [u8] {
         self.invariant();
         let (l, s, r) = unsafe { self.read_buf.align_to_mut::<u8>() };
@@ -37,6 +38,7 @@ impl Scratch {
         &mut s[..]
     }
 
+    #[inline]
     pub fn read_buffer_len(&self) -> usize {
         self.invariant();
         self.read_buf.len() * size_of::<libc::input_event>()
@@ -68,47 +70,66 @@ impl Scratch {
         debug_assert_eq!(self.read_buf.len(), self.timestamps_us.len());
     }
 
+    #[inline]
+    fn process_input_events_into<F>(
+        timestamps_us: &mut [i64],
+        input: &[libc::input_event],
+        mut f: F,
+    ) -> usize
+    where
+        F: FnMut(&libc::input_event) -> (bool, i64),
+    {
+        debug_assert!(
+            input.len() <= timestamps_us.len(),
+            "input batch exceeds scratch timestamp capacity"
+        );
+
+        let mut ix = 0;
+        for ev in input {
+            let (cond, val) = f(ev);
+            if cfg!(feature = "branchless") {
+                unsafe {
+                    let b = timestamps_us.get_unchecked_mut(ix);
+                    *b = val;
+                }
+                ix += select_unpredictable(cond, 1, 0);
+            } else if cond {
+                unsafe {
+                    *timestamps_us.get_unchecked_mut(ix) = val;
+                }
+                ix += 1;
+            }
+        }
+        ix
+    }
+
+    /// # Safety
+    ///
+    /// Process already-aligned input events without copying them into `self.read_buf`.
+    /// The caller must ensure `input.len() <= self.timestamps_us.len()`.
+    #[inline]
+    pub unsafe fn process_input_events<F>(&mut self, input: &[libc::input_event], mut f: F) -> &[i64]
+    where
+        F: FnMut(&libc::input_event) -> (bool, i64),
+    {
+        self.invariant();
+        let count = Self::process_input_events_into(&mut self.timestamps_us, input, &mut f);
+
+        &self.timestamps_us[..count]
+    }
+
     /// # Safety
     ///
     /// See [record_read] for the `read` parameter.
     #[inline]
-    pub unsafe fn process<F>(&mut self, read: usize, mut f: F) -> &[i64]
+    pub unsafe fn process<F>(&mut self, read: usize, f: F) -> &[i64]
     where
         F: FnMut(&libc::input_event) -> (bool, i64),
     {
         unsafe { self.record_read(read) };
         assert!(read.is_multiple_of(size_of::<libc::input_event>()));
-        let aligned = unsafe {
-            let (l, m, r) = self.read_buf[..read / size_of::<libc::input_event>()]
-                .align_to::<libc::input_event>();
-            assert!(
-                l.is_empty() && r.is_empty(),
-                "could not align read input event to the C struct"
-            );
-            m
-        };
-
-        let count = {
-            let mut ix = 0;
-            for ev in aligned {
-                let (cond, val) = f(ev);
-                if cfg!(feature = "branchless") {
-                    unsafe {
-                        let b = self.timestamps_us.get_unchecked_mut(ix);
-                        *b = val;
-                    }
-                    ix += select_unpredictable(cond, 1, 0);
-                } else if cond {
-                    unsafe {
-                        *self.timestamps_us.get_unchecked_mut(ix) = val;
-                    }
-                    ix += 1;
-                }
-            }
-            ix
-        };
-        self.invariant();
-
+        let events = &self.read_buf[..read / size_of::<libc::input_event>()];
+        let count = Self::process_input_events_into(&mut self.timestamps_us, events, f);
         &self.timestamps_us[..count]
     }
 }
