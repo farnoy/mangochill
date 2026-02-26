@@ -68,8 +68,26 @@ tracing-tracy = { version = "0.11.4", default-features = false, features = ["sam
 branchless = []
 tracy = ["tracing-tracy/enable", "tracing-log/log-tracer"]
 
+[dev-dependencies]
+criterion = { version = "0.8", features = ["html_reports"] }
+
+[[bench]]
+name = "scratch"
+harness = false
+
 [build-dependencies]
 capnpc = "0.25.0"
 
 [profile.release]
-debug = "line-tables-only"
+lto = "fat"
+# lto = false
+# debug = "line-tables-only"
+codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = "full"
+
+[profile.release-debug]
+inherits = "profiling"
+debug-assertions = true
