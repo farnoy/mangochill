@@ -18,7 +18,12 @@
   };
 
   outputs =
-    inputs@{ flake-parts, systems, cache-nix-action, ... }:
+    inputs@{
+      flake-parts,
+      systems,
+      cache-nix-action,
+      ...
+    }:
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = import systems;
 
@@ -51,8 +56,8 @@
             src = ./.;
           };
 
-          mangochill = (
-            cargoNix.workspaceMembers.mangochill.build.override {
+          mangochill =
+            (cargoNix.workspaceMembers.mangochill.build.override {
               crateOverrides = pkgs.defaultCrateOverrides // {
                 mangochill = attrs: {
                   extraRustcOpts = attrs.extraRustcOpts ++ [
@@ -62,10 +67,10 @@
                   nativeBuildInputs = [ pkgs.capnproto ];
                 };
               };
-            }
-          ).overrideAttrs {
-            meta.mainProgram = "mangochill-server";
-          };
+            }).overrideAttrs
+              {
+                meta.mainProgram = "mangochill-server";
+              };
 
           mangosrc = pkgs.fetchFromGitHub {
             owner = "farnoy";
@@ -145,7 +150,8 @@
           mangohud =
             (pkgs.mangohud.override {
               mangohud32 = pkgs.pkgsi686Linux.mangohud.overrideAttrs mangoOverride;
-            }).overrideAttrs mangoOverride;
+            }).overrideAttrs
+              mangoOverride;
 
           devShell = pkgs.mkShell {
             nativeBuildInputs = [
@@ -178,7 +184,7 @@
               derivations = [
                 devShell
               ];
-              paths = [];
+              paths = [ ];
             }).package;
         };
     };
