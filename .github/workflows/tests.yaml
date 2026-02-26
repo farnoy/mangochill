@@ -12,14 +12,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/nix
-      - run: nix develop --command cargo nextest run
+      - run: nix develop --quiet --command cargo --quiet nextest run
 
   miri-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/nix
-      - run: nix develop --command cargo miri nextest run
+      - run: nix develop --quiet --command cargo --quiet miri nextest run
         env:
           RUST_BACKTRACE: 1
           MIRIFLAGS: -Zmiri-env-forward=RUST_BACKTRACE -Zmiri-symbolic-alignment-check
@@ -29,11 +29,11 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/nix
-      - run: nix develop --command cargo run --bin mangochill-replay -- --input notebook/files/mouse-sample.ndjson
+      - run: nix develop --quiet --command cargo --quiet run --bin mangochill-replay -- --input notebook/files/mouse-sample.ndjson
 
   replay-python:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/nix
-      - run: cd notebook && devenv shell uv run python replay.py -i files/mouse-sample.ndjson
+      - run: cd notebook && devenv shell --quiet uv run python replay.py -i files/mouse-sample.ndjson
