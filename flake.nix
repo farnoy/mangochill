@@ -158,6 +158,7 @@
             nativeBuildInputs = [
               pkgs.capnproto
               pkgs.wasm-pack
+              pkgs.zstd
               rustToolchain
             ];
           };
