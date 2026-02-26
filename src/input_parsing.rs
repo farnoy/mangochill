@@ -3,20 +3,28 @@ use std::hint;
 use crate::scratch::Scratch;
 
 pub const AXIS_COUNT: usize = libc::ABS_CNT;
+pub const KEY_COUNT: usize = libc::KEY_CNT;
+const KEY_WORDS: usize = KEY_COUNT.div_ceil(64);
 const EV_SYN: u16 = 0;
 const SYN_DROPPED: u16 = 3;
 pub const EV_ABS: u16 = 3;
+pub const EV_KEY: u16 = 1;
 
 #[cfg(feature = "branchless")]
 const LAST_VALUES_COUNT: usize = AXIS_COUNT + 1;
 #[cfg(not(feature = "branchless"))]
 const LAST_VALUES_COUNT: usize = AXIS_COUNT;
+#[cfg(feature = "branchless")]
+const PRESSED_WORDS_COUNT: usize = KEY_WORDS + 1;
+#[cfg(not(feature = "branchless"))]
+const PRESSED_WORDS_COUNT: usize = KEY_WORDS;
 
 #[derive(Clone, Copy, Default)]
 pub struct DeviceCapabilities {
     pub is_pointer: bool,
     pub is_accelerometer: bool,
     pub has_abs: bool,
+    pub has_key: bool,
 }
 
 pub struct Axes {
@@ -43,6 +51,71 @@ impl Axes {
             deadzones,
         }
     }
+
+    #[inline]
+    fn any_active(&self) -> bool {
+        (0..AXIS_COUNT).fold(false, |acc, ix| {
+            acc | (self.last_values[ix] != i32::MIN
+                && self.last_values[ix].abs_diff(self.midpoints[ix]) >= self.deadzones[ix])
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct Buttons {
+    // In branchless mode, the trailing word is a padding slot for out-of-range key codes.
+    pressed: [u64; PRESSED_WORDS_COUNT],
+}
+
+impl Buttons {
+    #[inline]
+    fn update(&mut self, code: u16, value: i32) -> bool {
+        let key = usize::from(code);
+        if cfg!(feature = "branchless") {
+            let is_in_range = key < KEY_COUNT;
+            let word = hint::select_unpredictable(is_in_range, key / 64, PRESSED_WORDS_COUNT - 1);
+            let bit = 1u64 << (key % 64);
+            let old_word = self.pressed[word];
+            let was_pressed = old_word & bit != 0;
+            let is_release = value == 0;
+            let is_press = value == 1;
+
+            let set_bit = hint::select_unpredictable(is_press && !was_pressed, bit, 0);
+            let clear_bit = hint::select_unpredictable(is_release && was_pressed, bit, 0);
+            self.pressed[word] = (old_word | set_bit) & !clear_bit;
+
+            hint::select_unpredictable(is_in_range, is_press || is_release, true)
+        } else {
+            debug_assert!(key < KEY_COUNT);
+            let word = key / 64;
+            let bit = 1u64 << (key % 64);
+            let was_pressed = self.pressed[word] & bit != 0;
+
+            match value {
+                0 => {
+                    if was_pressed {
+                        self.pressed[word] &= !bit;
+                    }
+                    true
+                }
+                1 => {
+                    if !was_pressed {
+                        self.pressed[word] |= bit;
+                    }
+                    true
+                }
+                2 => false,
+                _ => false,
+            }
+        }
+    }
+
+    #[inline]
+    fn any_pressed(&self) -> bool {
+        self.pressed[..KEY_WORDS]
+            .iter()
+            .fold(false, |accu, &word| accu | (word != 0))
+    }
 }
 
 pub struct BatchOutcome<'a> {
@@ -51,11 +124,16 @@ pub struct BatchOutcome<'a> {
     pub is_active_indefinitely: bool,
 }
 
-pub trait ProcessorState<const HAS_ABS: bool> {
+pub trait ProcessorState<const HAS_ABS: bool, const HAS_KEY: bool> {
     type State;
 
     #[inline]
     fn handle_abs(_state: &mut Self::State, _ev: &libc::input_event) -> bool {
+        false
+    }
+
+    #[inline]
+    fn handle_key(_state: &mut Self::State, _ev: &libc::input_event) -> bool {
         false
     }
 
@@ -69,6 +147,7 @@ pub trait ProcessorState<const HAS_ABS: bool> {
         let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
         let is_ev_syn = ev.type_ == EV_SYN;
         let is_ev_abs = ev.type_ == EV_ABS;
+        let is_ev_key = ev.type_ == EV_KEY;
 
         let mut keep = if cfg!(feature = "branchless") {
             let is_abs_keep = if HAS_ABS {
@@ -76,15 +155,26 @@ pub trait ProcessorState<const HAS_ABS: bool> {
             } else {
                 false
             };
+            let is_key_keep = if HAS_KEY {
+                Self::handle_key(state, ev)
+            } else {
+                false
+            };
             hint::select_unpredictable(
                 is_ev_syn,
                 false,
-                hint::select_unpredictable(HAS_ABS && is_ev_abs, is_abs_keep, true),
+                hint::select_unpredictable(
+                    HAS_ABS && is_ev_abs,
+                    is_abs_keep,
+                    hint::select_unpredictable(HAS_KEY && is_ev_key, is_key_keep, true),
+                ),
             )
         } else if is_ev_syn {
             false
         } else if HAS_ABS && is_ev_abs {
             Self::handle_abs(state, ev)
+        } else if HAS_KEY && is_ev_key {
+            Self::handle_key(state, ev)
         } else {
             true
         };
@@ -147,39 +237,75 @@ pub trait ProcessorState<const HAS_ABS: bool> {
 
 pub struct Processor;
 
-impl ProcessorState<true> for Processor {
+#[inline]
+fn handle_abs(axes: &mut Axes, ev: &libc::input_event) -> bool {
+    let abs_id = usize::from(ev.code % AXIS_COUNT as u16);
+    let abs_midpoint = axes.midpoints[abs_id];
+    let abs_deadzone = axes.deadzones[abs_id];
+
+    if cfg!(feature = "branchless") {
+        let slot = hint::select_unpredictable(ev.type_ == EV_ABS, abs_id, LAST_VALUES_COUNT - 1);
+        axes.last_values[slot] = ev.value;
+    } else {
+        axes.last_values[abs_id] = ev.value;
+    }
+
+    ev.value.abs_diff(abs_midpoint) >= abs_deadzone
+}
+
+impl ProcessorState<true, true> for Processor {
+    type State = (Axes, Buttons, bool);
+
+    #[inline]
+    fn handle_abs(state: &mut Self::State, ev: &libc::input_event) -> bool {
+        let (axes, _, _) = state;
+        handle_abs(axes, ev)
+    }
+
+    #[inline]
+    fn handle_key(state: &mut Self::State, ev: &libc::input_event) -> bool {
+        let (_, buttons, _) = state;
+        buttons.update(ev.code, ev.value)
+    }
+
+    #[inline]
+    fn is_active_indefinitely(state: &Self::State) -> bool {
+        let (axes, buttons, is_pointer) = state;
+        (!*is_pointer && axes.any_active()) || buttons.any_pressed()
+    }
+}
+
+impl ProcessorState<true, false> for Processor {
     type State = (Axes, bool);
 
     #[inline]
     fn handle_abs(state: &mut Self::State, ev: &libc::input_event) -> bool {
         let (axes, _) = state;
-        let abs_id = usize::from(ev.code % AXIS_COUNT as u16);
-        let abs_midpoint = axes.midpoints[abs_id];
-        let abs_deadzone = axes.deadzones[abs_id];
-
-        if cfg!(feature = "branchless") {
-            let slot =
-                hint::select_unpredictable(ev.type_ == EV_ABS, abs_id, LAST_VALUES_COUNT - 1);
-            axes.last_values[slot] = ev.value;
-        } else {
-            axes.last_values[abs_id] = ev.value;
-        }
-
-        ev.value.abs_diff(abs_midpoint) >= abs_deadzone
+        handle_abs(axes, ev)
     }
 
     #[inline]
     fn is_active_indefinitely(state: &Self::State) -> bool {
         let (axes, is_pointer) = state;
-        !is_pointer
-            && (0..AXIS_COUNT).any(|ix| {
-                axes.last_values[ix] != i32::MIN
-                    && axes.last_values[ix].abs_diff(axes.midpoints[ix]) >= axes.deadzones[ix]
-            })
+        !*is_pointer && axes.any_active()
     }
 }
 
-impl ProcessorState<false> for Processor {
+impl ProcessorState<false, true> for Processor {
+    type State = Buttons;
+
+    #[inline]
+    fn handle_key(state: &mut Self::State, ev: &libc::input_event) -> bool {
+        state.update(ev.code, ev.value)
+    }
+
+    #[inline]
+    fn is_active_indefinitely(state: &Self::State) -> bool {
+        state.any_pressed()
+    }
+}
+
+impl ProcessorState<false, false> for Processor {
     type State = ();
 
     #[inline]
@@ -227,7 +353,11 @@ mod tests {
 
         let mut state = ();
         let outcome = unsafe {
-            <Processor as ProcessorState<false>>::process_events(&mut scratch, &events, &mut state)
+            <Processor as ProcessorState<false, false>>::process_events(
+                &mut scratch,
+                &events,
+                &mut state,
+            )
         };
 
         assert_eq!(outcome.timestamps_us, &[101]);
@@ -245,7 +375,11 @@ mod tests {
         let min_max = [(-10, 10); AXIS_COUNT];
         let mut state = (Axes::from_min_max(&min_max), false);
         let outcome = unsafe {
-            <Processor as ProcessorState<true>>::process_events(&mut scratch, &events, &mut state)
+            <Processor as ProcessorState<true, false>>::process_events(
+                &mut scratch,
+                &events,
+                &mut state,
+            )
         };
 
         assert_eq!(outcome.timestamps_us, &[200]);
@@ -262,11 +396,128 @@ mod tests {
 
         let mut state = ();
         let outcome = unsafe {
-            <Processor as ProcessorState<false>>::process_events(&mut scratch, &events, &mut state)
+            <Processor as ProcessorState<false, false>>::process_events(
+                &mut scratch,
+                &events,
+                &mut state,
+            )
         };
 
         assert_eq!(outcome.timestamps_us, &[300]);
         assert!(!outcome.overflowed);
         assert!(!outcome.is_active_indefinitely);
+    }
+
+    #[test]
+    fn process_filled_read_with_key_press_reports_activity() {
+        let scratch = Scratch::new();
+        let mut scratch = scratch.borrow_mut();
+        let events = vec![input_event(400, EV_KEY, 30, 1)];
+        ensure_scratch_event_len(&mut scratch, events.len());
+
+        let mut state = Buttons::default();
+        let outcome = unsafe {
+            <Processor as ProcessorState<false, true>>::process_events(
+                &mut scratch,
+                &events,
+                &mut state,
+            )
+        };
+
+        assert_eq!(outcome.timestamps_us, &[400]);
+        assert!(!outcome.overflowed);
+        assert!(outcome.is_active_indefinitely);
+    }
+
+    #[test]
+    fn process_filled_read_with_key_repeat_is_ignored() {
+        let scratch = Scratch::new();
+        let mut scratch = scratch.borrow_mut();
+        let events = vec![input_event(410, EV_KEY, 30, 2)];
+        ensure_scratch_event_len(&mut scratch, events.len());
+
+        let mut state = Buttons::default();
+        let outcome = unsafe {
+            <Processor as ProcessorState<false, true>>::process_events(
+                &mut scratch,
+                &events,
+                &mut state,
+            )
+        };
+
+        assert_eq!(outcome.timestamps_us, &[]);
+        assert!(!outcome.overflowed);
+        assert!(!outcome.is_active_indefinitely);
+    }
+
+    #[test]
+    fn process_filled_read_with_multi_key_hold_and_release_tracks_state() {
+        let scratch = Scratch::new();
+        let mut scratch = scratch.borrow_mut();
+        ensure_scratch_event_len(&mut scratch, 1);
+
+        let mut state = Buttons::default();
+
+        let press_a = vec![input_event(420, EV_KEY, 30, 1)];
+        let press_b = vec![input_event(421, EV_KEY, 31, 1)];
+        let release_a = vec![input_event(422, EV_KEY, 30, 0)];
+        let release_b = vec![input_event(423, EV_KEY, 31, 0)];
+
+        let a = unsafe {
+            <Processor as ProcessorState<false, true>>::process_events(
+                &mut scratch,
+                &press_a,
+                &mut state,
+            )
+        };
+        assert!(a.is_active_indefinitely);
+
+        let b = unsafe {
+            <Processor as ProcessorState<false, true>>::process_events(
+                &mut scratch,
+                &press_b,
+                &mut state,
+            )
+        };
+        assert!(b.is_active_indefinitely);
+
+        let c = unsafe {
+            <Processor as ProcessorState<false, true>>::process_events(
+                &mut scratch,
+                &release_a,
+                &mut state,
+            )
+        };
+        assert!(c.is_active_indefinitely);
+
+        let d = unsafe {
+            <Processor as ProcessorState<false, true>>::process_events(
+                &mut scratch,
+                &release_b,
+                &mut state,
+            )
+        };
+        assert!(!d.is_active_indefinitely);
+    }
+
+    #[test]
+    fn process_filled_read_with_pointer_abs_and_pressed_key_reports_activity() {
+        let scratch = Scratch::new();
+        let mut scratch = scratch.borrow_mut();
+        let events = vec![input_event(430, EV_KEY, 32, 1)];
+        ensure_scratch_event_len(&mut scratch, events.len());
+
+        let min_max = [(-10, 10); AXIS_COUNT];
+        let mut state = (Axes::from_min_max(&min_max), Buttons::default(), true);
+        let outcome = unsafe {
+            <Processor as ProcessorState<true, true>>::process_events(
+                &mut scratch,
+                &events,
+                &mut state,
+            )
+        };
+
+        assert_eq!(outcome.timestamps_us, &[430]);
+        assert!(outcome.is_active_indefinitely);
     }
 }
