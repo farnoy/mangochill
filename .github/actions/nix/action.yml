@@ -30,5 +30,5 @@ runs:
       shell: bash
     - run: nix profile add .#saveFromGC
       shell: bash
-    - run: cargo install cargo-nextest --locked
+    - run: cargo install cargo-nextest --locked || echo nextest already installed
       shell: bash
