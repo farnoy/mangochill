@@ -108,7 +108,11 @@ impl Scratch {
     /// Process already-aligned input events without copying them into `self.read_buf`.
     /// The caller must ensure `input.len() <= self.timestamps_us.len()`.
     #[inline]
-    pub unsafe fn process_input_events<F>(&mut self, input: &[libc::input_event], mut f: F) -> &[i64]
+    pub unsafe fn process_input_events<F>(
+        &mut self,
+        input: &[libc::input_event],
+        mut f: F,
+    ) -> &[i64]
     where
         F: FnMut(&libc::input_event) -> (bool, i64),
     {

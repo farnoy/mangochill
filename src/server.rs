@@ -39,7 +39,7 @@ use log::{debug, error, info, trace, warn};
 use mangochill::{
     bootstrap::MangoChillImpl,
     fps_limiter::{FpsLimiterImpl, FpsSubscribers, feed_events},
-    input_parsing::{self, AXIS_COUNT, Axes, DeviceCapabilities},
+    input_parsing::{self, AXIS_COUNT, Axes, Buttons, DeviceCapabilities, EV_ABS, EV_KEY},
     mangochill_capnp::{
         self,
         raw_events::{RegisterParams, RegisterResults},
@@ -391,7 +391,7 @@ async fn watch_device(
 
     nix::ioctl_write_ptr!(eviocsclockid, b'E', 0xa0, libc::c_int);
     if let Err(e) = unsafe { eviocsclockid(fd, &libc::CLOCK_MONOTONIC) } {
-        warn!("EVIOCSCLOCKID failed on {path:?}: {e}");
+        error!("EVIOCSCLOCKID failed on {path:?}: {e}; aborting device");
         return;
     }
 
@@ -407,21 +407,24 @@ async fn watch_device(
     }
     let is_pointer = properties[0] & (1u8 << input_prop_pointer) != 0;
     let is_accelerometer = properties[0] & (1u8 << input_prop_accelerometer) != 0;
-    let has_abs = {
+    let (has_abs, has_key) = {
         let ev_max = usize::from(libc::EV_MAX);
         let event_bits_len = (ev_max + 8) / 8;
         let mut event_bits = vec![0u8; event_bits_len];
         let req = request_code_read!(b'E', 0x20, event_bits_len);
         match unsafe { nix::errno::Errno::result(libc::ioctl(fd, req, event_bits.as_mut_ptr())) } {
             Ok(_) => {
-                let ev_abs = 3;
-                event_bits
-                    .get(ev_abs / 8)
-                    .is_some_and(|byte| byte & (1 << (ev_abs % 8)) != 0)
+                let has_abs = event_bits
+                    .get(usize::from(EV_ABS) / 8)
+                    .is_some_and(|byte| byte & (1 << (usize::from(EV_ABS) % 8)) != 0);
+                let has_key = event_bits
+                    .get(usize::from(EV_KEY) / 8)
+                    .is_some_and(|byte| byte & (1 << (usize::from(EV_KEY) % 8)) != 0);
+                (has_abs, has_key)
             }
             Err(e) => {
-                warn!("EVIOCGBIT failed on {path:?}: {e}; assuming EV_ABS support");
-                true
+                error!("EVIOCGBIT failed on {path:?}: {e}; aborting device");
+                return;
             }
         }
     };
@@ -429,6 +432,7 @@ async fn watch_device(
         is_pointer,
         is_accelerometer,
         has_abs,
+        has_key,
     };
     if caps.is_accelerometer {
         info!("ignoring accelerometer device {path:?}");
@@ -471,7 +475,33 @@ async fn watch_device(
         }
         let axes = Axes::from_min_max(&min_max);
 
-        ct.run_until_cancelled_owned(watch_device_loop::<true>(
+        if caps.has_key {
+            ct.run_until_cancelled_owned(watch_device_loop::<true, true>(
+                path.clone(),
+                device_id,
+                fd,
+                file,
+                fps_subscribers,
+                raw_subscribers,
+                scratch,
+                (axes, Buttons::default(), caps.is_pointer),
+            ))
+            .await
+        } else {
+            ct.run_until_cancelled_owned(watch_device_loop::<true, false>(
+                path.clone(),
+                device_id,
+                fd,
+                file,
+                fps_subscribers,
+                raw_subscribers,
+                scratch,
+                (axes, caps.is_pointer),
+            ))
+            .await
+        }
+    } else if caps.has_key {
+        ct.run_until_cancelled_owned(watch_device_loop::<false, true>(
             path.clone(),
             device_id,
             fd,
@@ -479,11 +509,11 @@ async fn watch_device(
             fps_subscribers,
             raw_subscribers,
             scratch,
-            (axes, caps.is_pointer),
+            Buttons::default(),
         ))
         .await
     } else {
-        ct.run_until_cancelled_owned(watch_device_loop::<false>(
+        ct.run_until_cancelled_owned(watch_device_loop::<false, false>(
             path.clone(),
             device_id,
             fd,
@@ -506,7 +536,8 @@ async fn watch_device(
     info!("device {device_id} ({:?}) stopped", path);
 }
 
-async fn watch_device_loop<const HAS_ABS: bool>(
+#[allow(clippy::too_many_arguments)]
+async fn watch_device_loop<const HAS_ABS: bool, const HAS_KEY: bool>(
     path: PathBuf,
     device_id: u16,
     fd: i32,
@@ -514,10 +545,10 @@ async fn watch_device_loop<const HAS_ABS: bool>(
     fps_subscribers: Rc<RefCell<FpsSubscribers>>,
     raw_subscribers: Rc<RefCell<RawSubscribers>>,
     scratch: Rc<RefCell<Scratch>>,
-    mut state: <input_parsing::Processor as input_parsing::ProcessorState<HAS_ABS>>::State,
+    mut state: <input_parsing::Processor as input_parsing::ProcessorState<HAS_ABS, HAS_KEY>>::State,
 ) -> io::Result<()>
 where
-    input_parsing::Processor: input_parsing::ProcessorState<HAS_ABS>,
+    input_parsing::Processor: input_parsing::ProcessorState<HAS_ABS, HAS_KEY>,
 {
     // The debouncer delays our reads from the chardev after it first becomes readable.
     // It also interacts with the late polling feature
@@ -592,11 +623,10 @@ where
             let span = trace_span!("watch_device::process_loop", device_id);
             let _g = span.enter();
             unsafe {
-                <input_parsing::Processor as input_parsing::ProcessorState<HAS_ABS>>::process_batch(
-                    &mut scratch,
-                    read,
-                    &mut state,
-                )
+                <input_parsing::Processor as input_parsing::ProcessorState<
+                    HAS_ABS,
+                    HAS_KEY,
+                >>::process_batch(&mut scratch, read, &mut state)
             }
         };
 
