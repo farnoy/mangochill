@@ -154,6 +154,7 @@
               mangoOverride;
 
           devShell = pkgs.mkShell {
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ stdenv.cc.cc.lib ]);
             nativeBuildInputs = [
               pkgs.capnproto
               pkgs.wasm-pack

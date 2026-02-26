@@ -8,6 +8,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio::task::{spawn_local, yield_now};
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
+use tracing::trace_span;
 
 use crate::ewm::DeviceEwm;
 use crate::mangochill_capnp;
@@ -160,14 +161,21 @@ async fn tick_loop(
         loop {
             ticker.tick().await;
 
+            let span = trace_span!("tick_loop::late_poll_begin", id, frequency_hz);
+            let g = span.enter();
+
             late_poll_sender
                 .send(())
                 .expect("failed to send late poll request");
 
-            // TODO: confirm this gives them enough of an opportunity?
-            //       if they're waiting with a readable socket, there should be
-            //       no suspensions until after observe_batch
+            drop(g);
+
+            // NOTE: confirmed with tracy that this in fact schedules watch_device()
+            //       to do their late polling
             yield_now().await;
+
+            let span = trace_span!("tick_loop::late_poll_resume", id, frequency_hz);
+            let g = span.enter();
 
             let (fps, handle) = {
                 let mut subs = subscribers.borrow_mut();
@@ -187,8 +195,11 @@ async fn tick_loop(
                 (max_fps as f32, sub.handle.clone())
             };
 
+            drop(g);
+
             let mut req = handle.receive_request();
             req.get().set_fps_limit(fps);
+            tracing::trace!(name: "sending reply", id, fps);
             if let Err(e) = req.send().promise.await {
                 warn!("fps tick send failed for subscriber {id}: {e}");
                 subscribers.borrow_mut().map.remove(&id);

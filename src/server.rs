@@ -29,6 +29,7 @@ use tokio_util::{
     sync::CancellationToken,
     task::TaskTracker,
 };
+use tracing::trace_span;
 
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
@@ -118,11 +119,31 @@ impl Drop for RawDisconnector {
     }
 }
 
+#[cfg(feature = "tracy")]
+register_demangler!();
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
     let cli = Cli::parse();
 
-    mangochill::init_logging(cli.verbosity.log_level_filter());
+    #[allow(unused_labels)]
+    'init: {
+        #[cfg(feature = "tracy")]
+        {
+            tracing_log::LogTracer::init_with_filter(cli.verbosity.log_level_filter())
+                .expect("failed to set up LogTracer");
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(tracing_tracy::TracyLayer::default()),
+            )
+            .expect("setup tracy layer");
+            break 'init;
+        }
+
+        #[allow(unreachable_code)]
+        {
+            mangochill::init_logging(cli.verbosity.log_level_filter());
+        }
+    }
 
     let rpc_socket = socket_path(cli.rpc_socket);
 
@@ -382,10 +403,11 @@ async fn watch_device(
             let mut is_ready = false;
             let mut was_interrupted = false;
             loop {
+                let prolog_was_ready = is_ready;
+                let prolog_was_interrupted = was_interrupted;
+
                 if is_ready {
-                    // TODO: verify if this is helpful at all
-                    info!("repeating read immediately");
-                    // yield_now().await;
+                    trace!("repeating read immediately");
                 } else {
                     ready_guard = file.ready_mut(Interest::READABLE).await?;
                     debouncer.restart();
@@ -408,6 +430,15 @@ async fn watch_device(
                     ready_guard.ready().is_readable(),
                     "I don't understand tokio"
                 );
+                let s = trace_span!(
+                    "watch_device::read_io",
+                    device_id,
+                    prolog_was_ready,
+                    is_ready,
+                    prolog_was_interrupted,
+                    was_interrupted,
+                );
+                let _g = s.enter();
 
                 let x = ready_guard.try_io(|f| {
                     // NOTE: we will reborrow after, important not to suspend until then
@@ -427,6 +458,7 @@ async fn watch_device(
                         continue;
                     }
                 };
+
                 let mut scratch = scratch.borrow_mut();
                 let read_full = read == scratch.read_buffer_len();
                 debug!(
@@ -436,6 +468,8 @@ async fn watch_device(
                 let mut prev = i64::MIN;
                 let mut overflowed = false;
                 let timestamps = unsafe {
+                    let span = trace_span!("watch_device::process_loop", device_id);
+                    let _g = span.enter();
                     scratch.process(read, |ev| {
                         let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
                         let result = (ts_us != prev, ts_us);
@@ -451,6 +485,16 @@ async fn watch_device(
                 } else if !read_full && !was_interrupted {
                     debouncer.expand();
                 }
+                let s = trace_span!(
+                    "watch_device::feed_events",
+                    path = path.to_str().unwrap(),
+                    device_id,
+                    read_bytes = read,
+                    filled_scratch = read_full,
+                    overflowed,
+                    compacted = timestamps.len()
+                );
+                let _g = s.enter();
 
                 feed_events(&mut fps_subscribers.borrow_mut(), device_id, timestamps);
 

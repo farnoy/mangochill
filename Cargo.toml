@@ -59,6 +59,13 @@ tokio = { version = "1.48.0", features = [
 ] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
 tokio-util = { version = "0.7.16", features = ["compat", "rt"] }
+tracing = "0.1.44"
+tracing-log = { version = "0.2.0", default-features = false, features = [ "std" ] }
+tracing-subscriber = "0.3.22"
+tracing-tracy = { version = "0.11.4", default-features = false, features = ["sampling", "broadcast", "callstack-inlines", "code-transfer", "context-switch-tracing", "system-tracing", "fibers", "demangle"] }
+
+[features]
+tracy = ["tracing-tracy/enable", "tracing-log/log-tracer"]
 
 [build-dependencies]
 capnpc = "0.25.0"
