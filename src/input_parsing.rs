@@ -6,6 +6,7 @@ pub const AXIS_COUNT: usize = libc::ABS_CNT;
 pub const KEY_COUNT: usize = libc::KEY_CNT;
 const KEY_WORDS: usize = KEY_COUNT.div_ceil(64);
 const EV_SYN: u16 = 0;
+const EV_MSC: u16 = 4;
 const SYN_DROPPED: u16 = 3;
 pub const EV_ABS: u16 = 3;
 pub const EV_KEY: u16 = 1;
@@ -146,6 +147,7 @@ pub trait ProcessorState<const HAS_ABS: bool, const HAS_KEY: bool> {
     ) -> (bool, i64) {
         let ts_us = ev.time.tv_sec * 1_000_000 + ev.time.tv_usec;
         let is_ev_syn = ev.type_ == EV_SYN;
+        let is_ev_msc = ev.type_ == EV_MSC;
         let is_ev_abs = ev.type_ == EV_ABS;
         let is_ev_key = ev.type_ == EV_KEY;
 
@@ -161,7 +163,7 @@ pub trait ProcessorState<const HAS_ABS: bool, const HAS_KEY: bool> {
                 false
             };
             hint::select_unpredictable(
-                is_ev_syn,
+                is_ev_syn | is_ev_msc,
                 false,
                 hint::select_unpredictable(
                     HAS_ABS && is_ev_abs,
@@ -169,7 +171,7 @@ pub trait ProcessorState<const HAS_ABS: bool, const HAS_KEY: bool> {
                     hint::select_unpredictable(HAS_KEY && is_ev_key, is_key_keep, true),
                 ),
             )
-        } else if is_ev_syn {
+        } else if is_ev_syn || is_ev_msc {
             false
         } else if HAS_ABS && is_ev_abs {
             Self::handle_abs(state, ev)
