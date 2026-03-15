@@ -20,6 +20,7 @@ struct FpsSubscriber {
     release_hl_us: f64,
     handle: mangochill_capnp::fps_receiver::Client,
     devices: HashMap<u16, DeviceEwm>,
+    last_sent_fps: u16,
 }
 
 pub struct FpsSubscribers {
@@ -116,6 +117,7 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
                 release_hl_us: long_hl as f64,
                 handle: handle.clone(),
                 devices: HashMap::new(),
+                last_sent_fps: 0,
             },
         );
 
@@ -177,7 +179,7 @@ async fn tick_loop(
             let span = trace_span!("tick_loop::late_poll_resume", id, frequency_hz);
             let g = span.enter();
 
-            let (fps, handle) = {
+            let send = {
                 let mut subs = subscribers.borrow_mut();
                 let Some(sub) = subs.map.get_mut(&id) else {
                     break;
@@ -192,10 +194,20 @@ async fn tick_loop(
                     }
                 }
 
-                (max_fps as f32, sub.handle.clone())
+                let rounded = max_fps.round() as u16;
+                if rounded == sub.last_sent_fps {
+                    None
+                } else {
+                    sub.last_sent_fps = rounded;
+                    Some((max_fps as f32, sub.handle.clone()))
+                }
             };
 
             drop(g);
+
+            let Some((fps, handle)) = send else {
+                continue;
+            };
 
             let mut req = handle.receive_request();
             req.get().set_fps_limit(fps);

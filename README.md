@@ -27,6 +27,12 @@ $ nix run github:farnoy/mangochill#mangochill-client -- -vv --min-fps 10 --max-f
 
 # use mangochill in your command line chain:
 PROTON_ADD_CONFIG=... gamemoderun mangochill-client ... -- mangohud %command%
+
+# works with gamescope too:
+gamescope --mangoapp mangochill-client ... %command%
+
+# the other way around as well:
+mangochill-client ... gamescope --mangoapp %command%
 ```
 
 ## Development
