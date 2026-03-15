@@ -2,7 +2,7 @@
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side};
 #[cfg(not(target_arch = "wasm32"))]
 use chrono::{DateTime, Utc};
-#[cfg(all(not(target_arch = "wasm32"), not(miri)))]
+#[cfg(all(not(target_arch = "wasm32"), not(miri), feature = "mimalloc"))]
 use mimalloc::MiMalloc;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
@@ -32,7 +32,7 @@ pub mod input_parsing;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scratch;
 
-#[cfg(all(not(target_arch = "wasm32"), not(miri)))]
+#[cfg(all(not(target_arch = "wasm32"), not(miri), feature = "mimalloc"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
