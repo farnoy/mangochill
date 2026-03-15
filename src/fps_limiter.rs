@@ -8,7 +8,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio::task::{spawn_local, yield_now};
 use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
-use tracing::trace_span;
+use tracing::{Instrument, trace_span};
 
 use crate::ewm::DeviceEwm;
 use crate::mangochill_capnp;
@@ -148,6 +148,7 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
     }
 }
 
+#[tracing::instrument(skip_all, fields(id, frequency_hz))]
 async fn tick_loop(
     id: u32,
     frequency_hz: u16,
@@ -161,23 +162,17 @@ async fn tick_loop(
 
     ct.run_until_cancelled(async {
         loop {
-            ticker.tick().await;
-
-            let span = trace_span!("tick_loop::late_poll_begin", id, frequency_hz);
-            let g = span.enter();
+            ticker.tick().instrument(trace_span!("interval tick")).await;
 
             late_poll_sender
                 .send(())
                 .expect("failed to send late poll request");
 
-            drop(g);
-
             // NOTE: confirmed with tracy that this in fact schedules watch_device()
             //       to do their late polling
-            yield_now().await;
-
-            let span = trace_span!("tick_loop::late_poll_resume", id, frequency_hz);
-            let g = span.enter();
+            yield_now()
+                .instrument(trace_span!("late poll yield_now"))
+                .await;
 
             let send = {
                 let mut subs = subscribers.borrow_mut();
@@ -202,8 +197,6 @@ async fn tick_loop(
                     Some((max_fps as f32, sub.handle.clone()))
                 }
             };
-
-            drop(g);
 
             let Some((fps, handle)) = send else {
                 continue;
