@@ -26,6 +26,8 @@ pub mod ewm;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fps_limiter;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod gamescope;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod input_parsing;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod scratch;

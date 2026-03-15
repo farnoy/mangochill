@@ -63,6 +63,9 @@ tracing = "0.1.44"
 tracing-log = { version = "0.2.0", default-features = false, features = [ "std" ] }
 tracing-subscriber = "0.3.22"
 tracing-tracy = { version = "0.11.4", default-features = false, features = ["sampling", "broadcast", "callstack-inlines", "code-transfer", "context-switch-tracing", "system-tracing", "fibers", "demangle"] }
+bitflags = "2"
+wayland-client = "0.31"
+wayland-scanner = "0.31"
 
 [features]
 branchless = []

@@ -8,6 +8,7 @@ use anyhow::anyhow;
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
 use log::{info, warn};
+use mangochill::gamescope::GamescopeConnection;
 use mangochill::mangochill_capnp::fps_receiver::{ReceiveParams, ReceiveResults};
 use mangochill::{connect_rpc, mangochill_capnp, socket_path};
 use regex::Regex;
@@ -45,7 +46,7 @@ struct Cli {
     #[arg(short = 's', long)]
     rpc_socket: Option<PathBuf>,
 
-    /// Timeout in seconds waiting for MangoHud socket to appear
+    /// Timeout in seconds waiting for backend socket to appear
     #[arg(long, default_value = "10")]
     socket_timeout_secs: u64,
 
@@ -54,8 +55,33 @@ struct Cli {
     command: Vec<String>,
 }
 
+enum FpsSink {
+    Gamescope(RefCell<GamescopeConnection>),
+    MangoHud(RefCell<std::os::unix::net::UnixStream>),
+}
+
+impl FpsSink {
+    fn detect_mangohud(child_pid: Option<u32>) -> Option<Self> {
+        use std::os::linux::net::SocketAddrExt;
+        let data = std::fs::read_to_string("/proc/net/unix").ok()?;
+        let socket_name = if let Some(pid) = child_pid {
+            let target = format!("mangohud-{pid}");
+            data.contains(&format!("@{target}")).then_some(target)?
+        } else {
+            let regex = Regex::new(r"@(mangohud-\d+)").expect("regex invalid");
+            regex.captures(&data)?.get(1)?.as_str().to_owned()
+        };
+        info!("using mangohud backend");
+        info!("Using MangoHud socket: {socket_name}");
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(&socket_name).ok()?;
+        let stream = std::os::unix::net::UnixStream::connect_addr(&addr).ok()?;
+        info!("MangoHud socket connected");
+        Some(Self::MangoHud(RefCell::new(stream)))
+    }
+}
+
 struct FpsReceiverImpl {
-    writer: Rc<RefCell<std::os::unix::net::UnixStream>>,
+    sink: Rc<FpsSink>,
     min_fps: u16,
     max_fps: u16,
 }
@@ -69,9 +95,18 @@ impl mangochill_capnp::fps_receiver::Server for FpsReceiverImpl {
         let p = params.get()?;
         let fps = p.get_fps_limit();
         let target = (fps.round() as u16).clamp(self.min_fps, self.max_fps);
-        let cmd = format!(":set_fps_limit={target};\n");
-        if let Err(e) = self.writer.borrow_mut().write_all(cmd.as_bytes()) {
-            return Err(capnp::Error::failed(e.to_string()));
+        match &*self.sink {
+            FpsSink::Gamescope(conn) => {
+                if let Err(e) = conn.borrow_mut().set_fps(target) {
+                    return Err(capnp::Error::failed(format!("gamescope: {e}")));
+                }
+            }
+            FpsSink::MangoHud(writer) => {
+                let cmd = format!(":set_fps_limit={target};\n");
+                if let Err(e) = writer.borrow_mut().write_all(cmd.as_bytes()) {
+                    return Err(capnp::Error::failed(e.to_string()));
+                }
+            }
         }
         Ok(())
     }
@@ -84,74 +119,58 @@ async fn main() -> anyhow::Result<()> {
 
     let ct = CancellationToken::new();
 
-    // Either spawn a child and wait for its specific socket, or scan for any existing one.
-    // NOTE: Seems to be good enough for mangochill-client -- gamemoderun mangohud %command%
-    //       but we might want to look at the first mangohud socket with pid >= child_pid?
-    //       It probably only works because gamemoderun does an exec()?
-    let (socket_name, mut child) = if cli.command.is_empty() {
-        let data = std::fs::read_to_string("/proc/net/unix")?;
-        let regex = Regex::new(r"@(mangohud-\d+)").expect("regex invalid");
-        let Some(m) = regex.captures(&data) else {
+    // Spawn child first (if given) so backends have time to start.
+    let mut child = if cli.command.is_empty() {
+        None
+    } else {
+        let c = tokio::process::Command::new(&cli.command[0])
+            .args(&cli.command[1..])
+            .spawn()
+            .map_err(|e| anyhow!("Failed to spawn `{}`: {e}", &cli.command[0]))?;
+        let pid = c
+            .id()
+            .ok_or_else(|| anyhow!("Child exited immediately after spawn"))?;
+        info!("Spawned child process (PID {pid}): {:?}", &cli.command);
+        Some((c, pid))
+    };
+
+    let child_pid = child.as_ref().map(|(_, pid)| *pid);
+    let mut poll = interval(Duration::from_millis(100));
+    poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(cli.socket_timeout_secs);
+
+    let sink = Rc::new(loop {
+        if let Some(conn) = GamescopeConnection::try_connect() {
+            info!("using gamescope backend");
+            break FpsSink::Gamescope(RefCell::new(conn));
+        }
+        if let Some(sink) = FpsSink::detect_mangohud(child_pid) {
+            break sink;
+        }
+        let Some((ref mut c, _)) = child else {
             return Err(anyhow!(
-                "MangoHud socket not found, is it running and \
+                "No backend found. Is gamescope running, or is MangoHud \
                 configured with `control = mangohud-%p`?"
             ));
         };
-        (m.get(1).unwrap().as_str().to_owned(), None)
-    } else {
-        let mut child = tokio::process::Command::new(&cli.command[0])
-            .args(&cli.command[1..])
-            .spawn()
-            .map_err(|e| anyhow!("Failed to spawn `{}`: {e}", cli.command[0]))?;
-
-        let child_pid = child
-            .id()
-            .ok_or_else(|| anyhow!("Child exited immediately after spawn"))?;
-        info!("Spawned child process (PID {child_pid}): {:?}", cli.command);
-
-        let target = format!("mangohud-{child_pid}");
-        let mut poll = interval(Duration::from_millis(100));
-        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        let wait_for_socket = async {
-            loop {
-                if let Ok(data) = std::fs::read_to_string("/proc/net/unix")
-                    && data.contains(&format!("@{target}"))
-                {
-                    break Ok(target);
-                }
-
-                tokio::select! {
-                    _ = poll.tick() => {}
-                    status = child.wait() => {
-                        let status = status?;
-                        return Err(anyhow!(
-                            "Child exited ({status}) before MangoHud socket appeared. \
-                            Is MangoHud configured with `control = mangohud-%p`?"
-                        ));
-                    }
-                }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "Timed out after {:?} waiting for a backend socket",
+                Duration::from_secs(cli.socket_timeout_secs),
+            ));
+        }
+        tokio::select! {
+            _ = poll.tick() => {}
+            status = c.wait() => {
+                let status = status?;
+                return Err(anyhow!(
+                    "Child exited ({status}) before a backend socket appeared. \
+                    Is gamescope running, or is MangoHud configured with \
+                    `control = mangohud-%p`?"
+                ));
             }
-        };
-        let duration = Duration::from_secs(cli.socket_timeout_secs);
-        let socket_name = timeout(duration, wait_for_socket).await;
-
-        let socket_name = socket_name.map_err(|elapsed| {
-            anyhow!(
-                "Timed out after {elapsed} waiting for @mangohud-{child_pid} MangoHud \
-                socket to appear. Is MangoHud configured with `control = mangohud-%p`?"
-            )
-        })??;
-        (socket_name, Some((child, child_pid)))
-    };
-
-    info!("Using MangoHud socket: {socket_name}");
-    let addr =
-        <std::os::unix::net::SocketAddr as std::os::linux::net::SocketAddrExt>::from_abstract_name(
-            &socket_name,
-        )?;
-    let stream = std::os::unix::net::UnixStream::connect_addr(&addr)?;
-    let writer = Rc::new(RefCell::new(stream));
-    info!("MangoHud socket connected");
+        }
+    });
 
     let set = LocalSet::new();
     let _set_guard = set.enter();
@@ -197,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
                     };
 
                     let receiver = FpsReceiverImpl {
-                        writer: writer.clone(),
+                        sink: sink.clone(),
                         min_fps,
                         max_fps,
                     };
@@ -239,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
     }));
 
     set.run_until(async move {
-        match &mut child {
+        match child.as_mut() {
             None => {
                 mangochill::termination_signal().await;
                 info!("exiting");
