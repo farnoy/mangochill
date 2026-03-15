@@ -226,9 +226,8 @@ async fn tick_loop(
 fn snap_to_divider(max_fps: u16, min_fps: u16, target: f64) -> f64 {
     let mut best = max_fps;
     for n in 2..=max_fps {
-        if !max_fps.is_multiple_of(n) {
-            continue;
-        }
+        // this matches gamescope's int division that computes `nVblankDivisor`
+        // e.g. max_fps=90, n=4 => d=22.5 as u16, so 22
         let d = max_fps / n;
         if (d as f64 - target).abs() >= (best as f64 - target).abs() {
             break;
