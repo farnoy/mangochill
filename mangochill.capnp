@@ -27,7 +27,8 @@ interface FpsLimiter {
     maxFps :UInt16,
     attackHalfLifeMicroseconds :UInt32,
     releaseHalfLifeMicroseconds :UInt32,
-    receiver :FpsReceiver
+    receiver :FpsReceiver,
+    snapToDivider :Bool
   ) -> (subscription :Subscription);
 }
 

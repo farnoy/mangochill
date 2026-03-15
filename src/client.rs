@@ -46,6 +46,10 @@ struct Cli {
     #[arg(short = 's', long)]
     rpc_socket: Option<PathBuf>,
 
+    /// Snap FPS to the nearest integer divider of max-fps. Useful in non-VRR environments.
+    #[arg(long)]
+    snap: bool,
+
     /// Timeout in seconds waiting for backend socket to appear
     #[arg(long, default_value = "10")]
     socket_timeout_secs: u64,
@@ -182,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
     let frequency = cli.frequency;
     let min_fps = cli.min_fps;
     let max_fps = cli.max_fps;
+    let snap = cli.snap;
 
     let ct_rpc = ct.child_token();
     spawn_local(ct_rpc.clone().run_until_cancelled_owned(async move {
@@ -231,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                     req.get()
                         .set_release_half_life_microseconds(release_half_life_us);
                     req.get().set_receiver(receiver_client);
+                    req.get().set_snap_to_divider(snap);
 
                     match timeout(Duration::from_secs(5), req.send().promise).await {
                         Ok(Ok(resp)) => {

@@ -14,10 +14,11 @@ use crate::ewm::DeviceEwm;
 use crate::mangochill_capnp;
 
 struct FpsSubscriber {
-    min_fps: f64,
-    max_fps: f64,
-    attack_hl_us: f64,
-    release_hl_us: f64,
+    min_fps: u16,
+    max_fps: u16,
+    attack_hl_us: u32,
+    release_hl_us: u32,
+    snap_to_divider: bool,
     handle: mangochill_capnp::fps_receiver::Client,
     devices: HashMap<u16, DeviceEwm>,
     last_sent_fps: u16,
@@ -99,6 +100,7 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
         if short_hl == 0 || long_hl == 0 {
             return Err(capnp::Error::failed("half-lives must be > 0".to_string()));
         }
+        let snap_to_divider = p.get_snap_to_divider();
         let handle = p.get_receiver()?;
 
         let id = {
@@ -108,13 +110,18 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
             i
         };
 
+        info!(
+            "fps subscriber {id} registered: {frequency_hz}Hz, fps {min_fps}-{max_fps}, attack/release {short_hl}/{long_hl}µs, snap={snap_to_divider}"
+        );
+
         self.subscribers.borrow_mut().map.insert(
             id,
             FpsSubscriber {
-                min_fps: min_fps as f64,
-                max_fps: max_fps as f64,
-                attack_hl_us: short_hl as f64,
-                release_hl_us: long_hl as f64,
+                min_fps,
+                max_fps,
+                attack_hl_us: short_hl,
+                release_hl_us: long_hl,
+                snap_to_divider,
                 handle: handle.clone(),
                 devices: HashMap::new(),
                 last_sent_fps: 0,
@@ -140,10 +147,6 @@ impl mangochill_capnp::fps_limiter::Server for FpsLimiterImpl {
             notify: Rc::clone(&self.notify),
         });
         ret.get().set_subscription(disconnector);
-
-        info!(
-            "fps subscriber {id} registered: {frequency_hz}Hz, fps {min_fps}-{max_fps}, attack/release {short_hl}/{long_hl}µs"
-        );
         Ok(())
     }
 }
@@ -181,20 +184,23 @@ async fn tick_loop(
                 };
 
                 let now_us = crate::monotonic_us();
-                let mut max_fps = sub.min_fps;
+                let mut target_fps = sub.min_fps as f64;
                 for ewm in sub.devices.values_mut() {
-                    let fps = ewm.compute_fps(now_us, sub.min_fps, sub.max_fps);
-                    if fps > max_fps {
-                        max_fps = fps;
+                    let fps = ewm.compute_fps(now_us, sub.min_fps as f64, sub.max_fps as f64);
+                    if fps > target_fps {
+                        target_fps = fps;
                     }
                 }
 
-                let rounded = max_fps.round() as u16;
+                if sub.snap_to_divider {
+                    target_fps = snap_to_divider(sub.max_fps, sub.min_fps, target_fps);
+                }
+                let rounded = target_fps.round() as u16;
                 if rounded == sub.last_sent_fps {
                     None
                 } else {
                     sub.last_sent_fps = rounded;
-                    Some((max_fps as f32, sub.handle.clone()))
+                    Some((target_fps as f32, sub.handle.clone()))
                 }
             };
 
@@ -217,6 +223,24 @@ async fn tick_loop(
     info!("tick loop {id} stopped");
 }
 
+fn snap_to_divider(max_fps: u16, min_fps: u16, target: f64) -> f64 {
+    let mut best = max_fps;
+    for n in 2..=max_fps {
+        if !max_fps.is_multiple_of(n) {
+            continue;
+        }
+        let d = max_fps / n;
+        if (d as f64 - target).abs() >= (best as f64 - target).abs() {
+            break;
+        }
+        best = d;
+        if d <= min_fps {
+            break;
+        }
+    }
+    best as f64
+}
+
 pub fn feed_events(
     subscribers: &mut FpsSubscribers,
     device_id: u16,
@@ -227,7 +251,7 @@ pub fn feed_events(
         let ewm = sub
             .devices
             .entry(device_id)
-            .or_insert_with(|| DeviceEwm::new(sub.attack_hl_us, sub.release_hl_us));
+            .or_insert_with(|| DeviceEwm::new(sub.attack_hl_us as f64, sub.release_hl_us as f64));
         ewm.observe_batch(timestamps_us);
         ewm.active_indefinitely(is_active_indefinitely);
     }
