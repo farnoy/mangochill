@@ -130,7 +130,7 @@ impl GamescopeConnection {
     pub fn set_fps(&mut self, fps: u16) -> anyhow::Result<()> {
         let _ = self.queue.dispatch_pending(&mut self.state);
 
-        let mut flags = gamescope_control::TargetRefreshCycleFlag::AllowRefreshSwitching;
+        let mut flags = gamescope_control::TargetRefreshCycleFlag::empty();
         if self.state.is_internal_display {
             flags |= gamescope_control::TargetRefreshCycleFlag::InternalDisplay;
         }
