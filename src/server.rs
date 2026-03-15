@@ -30,7 +30,7 @@ use tokio_util::{
     sync::CancellationToken,
     task::TaskTracker,
 };
-use tracing::trace_span;
+use tracing::{debug_span, trace_span};
 
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
@@ -124,7 +124,10 @@ impl Drop for RawDisconnector {
 }
 
 #[cfg(feature = "tracy")]
-register_demangler!();
+mod tracy_setup {
+    use tracing_tracy::client::register_demangler;
+    register_demangler!();
+}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> io::Result<()> {
@@ -134,6 +137,8 @@ async fn main() -> io::Result<()> {
     'init: {
         #[cfg(feature = "tracy")]
         {
+            use tracing_subscriber::layer::SubscriberExt;
+
             tracing_log::LogTracer::init_with_filter(cli.verbosity.log_level_filter())
                 .expect("failed to set up LogTracer");
             tracing::subscriber::set_global_default(
@@ -365,6 +370,7 @@ async fn evdev_supervisor(
     Ok(())
 }
 
+#[tracing::instrument(skip_all, fields(device_id, path = ?path))]
 async fn watch_device(
     path: PathBuf,
     device_id: u16,
