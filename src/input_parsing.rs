@@ -57,7 +57,7 @@ impl Axes {
     fn any_active(&self) -> bool {
         (0..AXIS_COUNT).fold(false, |acc, ix| {
             acc | (self.last_values[ix] != i32::MIN
-                && self.last_values[ix].abs_diff(self.midpoints[ix]) >= self.deadzones[ix])
+                && self.last_values[ix].abs_diff(self.midpoints[ix]) > self.deadzones[ix])
         })
     }
 }
