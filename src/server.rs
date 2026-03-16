@@ -404,6 +404,8 @@ async fn watch_device(
     nix::ioctl_read_buf!(eviocgprop, b'E', 0x09, libc::c_uchar);
     let input_prop_pointer =
         u8::try_from(libc::INPUT_PROP_POINTER).expect("INPUT_PROP_POINTER must fit into u8");
+    let input_prop_direct =
+        u8::try_from(libc::INPUT_PROP_DIRECT).expect("INPUT_PROP_DIRECT must fit into u8");
     let input_prop_accelerometer = u8::try_from(libc::INPUT_PROP_ACCELEROMETER)
         .expect("INPUT_PROP_ACCELEROMETER must fit into u8");
     let mut properties = [0u8; 1];
@@ -411,7 +413,8 @@ async fn watch_device(
         warn!("EVIOCGPROP failed on {path:?}: {e}");
         return;
     }
-    let is_pointer = properties[0] & (1u8 << input_prop_pointer) != 0;
+    let is_pointer = properties[0] & (1u8 << input_prop_pointer) != 0
+        || properties[0] & (1u8 << input_prop_direct) != 0;
     let is_accelerometer = properties[0] & (1u8 << input_prop_accelerometer) != 0;
     let (has_abs, has_key) = {
         let ev_max = usize::from(libc::EV_MAX);
