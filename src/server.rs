@@ -34,7 +34,7 @@ use tracing::trace_span;
 
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
-use log::{debug, error, info, trace, warn};
+use log::{error, info, trace, warn};
 
 use mangochill::{
     bootstrap::MangoChillImpl,
@@ -166,7 +166,6 @@ async fn main() -> io::Result<()> {
     let set = LocalSet::new();
 
     set.run_until(async {
-        debug!("in run_until");
         let supervisor = spawn_local(evdev_supervisor(
             fps_subscribers.clone(),
             raw_subscribers.clone(),
@@ -181,7 +180,6 @@ async fn main() -> io::Result<()> {
             notify.clone(),
             ct.child_token(),
         ));
-        debug!("waiting for signals");
 
         mangochill::termination_signal().await;
 
@@ -212,8 +210,6 @@ async fn serve(
     let listener = UnixListener::bind(&rpc_socket).unwrap();
     std::fs::set_permissions(&rpc_socket, std::fs::Permissions::from_mode(0o666)).unwrap();
     let mut incoming = UnixListenerStream::new(listener);
-    debug!("spawning rpc");
-
     let fps_limiter_client: mangochill_capnp::fps_limiter::Client = capnp_rpc::new_client(
         FpsLimiterImpl::new(fps_subscribers, ct.child_token(), Rc::clone(&notify)),
     );
@@ -230,8 +226,6 @@ async fn serve(
 
     let bootstrap: mangochill_capnp::mango_chill::Client =
         capnp_rpc::new_client(MangoChillImpl::new(fps_limiter_client, raw_events_client));
-
-    debug!("spawned rpc");
 
     let child_ct = ct.child_token();
 
@@ -624,7 +618,7 @@ where
 
         let mut scratch = scratch.borrow_mut();
         let read_full = read == scratch.read_buffer_len();
-        debug!(
+        trace!(
             "read {read}, full={read_full} because scratch len={}",
             scratch.read_buffer_len()
         );
