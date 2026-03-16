@@ -39,7 +39,7 @@ struct Cli {
     release_half_life_ms: f64,
 
     /// FPS update frequency in Hz
-    #[arg(long, default_value = "200")]
+    #[arg(long, default_value = "10")]
     frequency: u16,
 
     /// Unix socket path to the RPC server
