@@ -121,6 +121,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     mangochill::init_logging(cli.verbosity.log_level_filter());
 
+    let _ = std::fs::write(
+        "/tmp/mangochill-client-deck",
+        format!("SteamDeck? {:?}", std::env::var("SteamDeck")),
+    );
+
     let ct = CancellationToken::new();
 
     // Spawn child first (if given) so backends have time to start.

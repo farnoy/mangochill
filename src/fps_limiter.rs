@@ -185,17 +185,23 @@ async fn tick_loop(
 
                 let now_us = crate::monotonic_us();
                 let mut target_fps = sub.min_fps as f64;
-                for ewm in sub.devices.values_mut() {
+                let mut device_id = 0;
+                for (id, mut ewm) in sub.devices.iter_mut() {
                     let fps = ewm.compute_fps(now_us, sub.min_fps as f64, sub.max_fps as f64);
                     if fps > target_fps {
                         target_fps = fps;
+                        device_id = *id;
                     }
                 }
 
+                info!("max target_fps={target_fps} from device={device_id} subscriber={id}");
+
                 if sub.snap_to_divider {
                     target_fps = snap_to_divider(sub.max_fps, sub.min_fps, target_fps);
+                    info!("snapping target_fps to {target_fps}");
                 }
                 let rounded = target_fps.round() as u16;
+                info!("rounded target_fps to {target_fps}");
                 if rounded == sub.last_sent_fps {
                     None
                 } else {
@@ -210,7 +216,7 @@ async fn tick_loop(
 
             let mut req = handle.receive_request();
             req.get().set_fps_limit(fps);
-            tracing::trace!(name: "sending reply", id, fps);
+            info!("sending reply {id} fps={fps}");
             if let Err(e) = req.send().promise.await {
                 warn!("fps tick send failed for subscriber {id}: {e}");
                 subscribers.borrow_mut().map.remove(&id);

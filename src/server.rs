@@ -154,6 +154,8 @@ async fn main() -> io::Result<()> {
         }
     }
 
+    info!("SteamDeck? {:?}", std::env::var("SteamDeck"));
+
     let rpc_socket = socket_path(cli.rpc_socket);
 
     let fps_subscribers = Rc::new(RefCell::new(FpsSubscribers::new()));
