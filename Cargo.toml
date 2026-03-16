@@ -95,8 +95,3 @@ debug = "full"
 [profile.release-debug]
 inherits = "profiling"
 debug-assertions = true
-
-[patch.crates-io]
-tracy-client = { git = "https://github.com/farnoy/rust_tracy_client" }
-tracy-client-sys = { git = "https://github.com/farnoy/rust_tracy_client" }
-tracing-tracy = { git = "https://github.com/farnoy/rust_tracy_client" }
