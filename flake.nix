@@ -14,7 +14,7 @@
       url = "github:nix-community/cache-nix-action";
       flake = false;
     };
-    systems.url = "github:nix-systems/default";
+    systems.url = "github:nix-systems/default-linux";
   };
 
   outputs =
