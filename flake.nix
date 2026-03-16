@@ -58,7 +58,7 @@
 
           mangochill =
             (cargoNix.workspaceMembers.mangochill.build.override {
-              features = [ "mimalloc" ];
+              features = [ "mimalloc" "log/release_max_level_info" ];
               crateOverrides = pkgs.defaultCrateOverrides // {
                 mangochill = attrs: {
                   extraRustcOpts = attrs.extraRustcOpts ++ [
