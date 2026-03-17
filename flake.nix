@@ -168,7 +168,14 @@
           packages = {
             mangochill = mangochill;
             mangochill-server = mangochill;
-            mangochill-client = mangochill.overrideAttrs { meta.mainProgram = "mangochill-client"; };
+            mangochill-client = mangochill.overrideAttrs (old: {
+              meta.mainProgram = "mangochill-client";
+              nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.makeWrapper ];
+              postFixup = (old.postFixup or "") + ''
+                wrapProgram $out/bin/mangochill-client \
+                  --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xorg.xprop ]}
+              '';
+            });
             mangohud = mangohud;
           };
 

@@ -4,8 +4,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
+use anyhow::Context;
 use anyhow::anyhow;
+use anyhow::bail;
+use clap::CommandFactory;
 use clap::Parser;
+use clap::error::ErrorKind;
 use clap_verbosity_flag::Verbosity;
 use log::{info, warn};
 use mangochill::gamescope::GamescopeConnection;
@@ -24,7 +28,7 @@ struct Cli {
 
     /// Max FPS that can ever be set
     #[arg(short = 't', long)]
-    max_fps: u16,
+    max_fps: Option<u16>,
 
     /// Min FPS that can ever be set
     #[arg(short = 'f', long)]
@@ -84,6 +88,79 @@ impl FpsSink {
     }
 }
 
+fn run_xprop(display: &str, props: &[&str]) -> anyhow::Result<String> {
+    let mut cmd = std::process::Command::new("xprop");
+    cmd.args(["-root", "-display", display]);
+    cmd.args(props);
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to run `xprop -root -display {display}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "`xprop -root -display {display}` exited with {}: {stderr}",
+            output.status
+        );
+    }
+    String::from_utf8(output.stdout).context("`xprop -root` returned non-UTF-8 output")
+}
+
+fn x11_display_numbers() -> Vec<u32> {
+    let mut nums: Vec<u32> = std::fs::read_dir("/tmp/.X11-unix")
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .strip_prefix('X')?
+                .parse()
+                .ok()
+        })
+        .collect();
+    nums.sort();
+    nums
+}
+
+fn detect_gamescope_max_fps(timeout: Duration) -> anyhow::Result<u16> {
+    let deadline = std::time::Instant::now() + timeout;
+    let focused_re =
+        Regex::new(r"(?m)^GAMESCOPE_FOCUSED_WINDOW\(CARDINAL\) = \d+").expect("regex invalid");
+    let refresh_re =
+        Regex::new(r"(?m)^GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK\(CARDINAL\) = (\d+)")
+            .expect("regex invalid");
+    let displays: Vec<String> = x11_display_numbers()
+        .into_iter()
+        .map(|n| format!(":{n}"))
+        .collect();
+
+    info!("Waiting for gamescope to focus a window before reading refresh rate...");
+    loop {
+        for display in &displays {
+            let stdout = run_xprop(
+                display,
+                &[
+                    "GAMESCOPE_FOCUSED_WINDOW",
+                    "GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK",
+                ],
+            );
+            if let Ok(stdout) = stdout
+                && focused_re.is_match(&stdout)
+                && let Some(caps) = refresh_re.captures(&stdout)
+                && let Ok(rate) = caps[1].parse()
+            {
+                info!("found gamescope properties on {display}");
+                return Ok(rate);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!("timed out waiting for gamescope to focus a window");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 struct FpsReceiverImpl {
     sink: Rc<FpsSink>,
     min_fps: u16,
@@ -120,8 +197,6 @@ impl mangochill_capnp::fps_receiver::Server for FpsReceiverImpl {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     mangochill::init_logging(cli.verbosity.log_level_filter());
-
-    let ct = CancellationToken::new();
 
     // Spawn child first (if given) so backends have time to start.
     let mut child = if cli.command.is_empty() {
@@ -176,6 +251,26 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    let is_gamescope = matches!(*sink, FpsSink::Gamescope(_));
+    let max_fps = match cli.max_fps {
+        Some(max_fps) => max_fps,
+        None if is_gamescope => {
+            let max_fps = detect_gamescope_max_fps(Duration::from_secs(cli.socket_timeout_secs))
+                .context(
+                    "failed to auto-detect max FPS from gamescope.\
+                    Specify --max-fps manually to skip auto-detection",
+                )?;
+            info!("Auto-detected max FPS from gamescope: {max_fps}");
+            max_fps
+        }
+        None => Cli::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "--max-fps is required when not using gamescope",
+            )
+            .exit(),
+    };
+
     let set = LocalSet::new();
     let _set_guard = set.enter();
 
@@ -185,9 +280,10 @@ async fn main() -> anyhow::Result<()> {
     let release_half_life_us = (cli.release_half_life_ms * 1000.0) as u32;
     let frequency = cli.frequency;
     let min_fps = cli.min_fps;
-    let max_fps = cli.max_fps;
-    let snap = cli.snap;
+    let is_steam_deck = matches!(std::env::var("SteamDeck").as_deref(), Ok("1"));
+    let snap = cli.snap || is_steam_deck;
 
+    let ct = CancellationToken::new();
     let ct_rpc = ct.child_token();
     spawn_local(ct_rpc.clone().run_until_cancelled_owned(async move {
         let mut retry = interval(Duration::from_secs(1));
