@@ -30,9 +30,6 @@ PROTON_ADD_CONFIG=... gamemoderun mangochill-client ... -- mangohud %command%
 
 # works with gamescope too:
 gamescope --mangoapp mangochill-client ... %command%
-
-# the other way around as well:
-mangochill-client ... gamescope --mangoapp %command%
 ```
 
 ## Development
