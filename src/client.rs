@@ -31,7 +31,7 @@ struct Cli {
     max_fps: Option<u16>,
 
     /// Min FPS that can ever be set
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, default_value_t = 30)]
     min_fps: u16,
 
     /// Attack (rising) half-life in milliseconds
