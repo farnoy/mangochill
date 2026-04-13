@@ -130,7 +130,7 @@ mod tracy_setup {
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> io::Result<()> {
+async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     #[allow(unused_labels)]
@@ -150,7 +150,7 @@ async fn main() -> io::Result<()> {
 
         #[allow(unreachable_code)]
         {
-            mangochill::init_logging(cli.verbosity.log_level_filter());
+            mangochill::init_logging(cli.verbosity.log_level_filter())?;
         }
     }
 
