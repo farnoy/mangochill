@@ -196,7 +196,7 @@ impl mangochill_capnp::fps_receiver::Server for FpsReceiverImpl {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    mangochill::init_logging(cli.verbosity.log_level_filter());
+    mangochill::init_logging(cli.verbosity.log_level_filter())?;
 
     // Spawn child first (if given) so backends have time to start.
     let mut child = if cli.command.is_empty() {

@@ -32,6 +32,8 @@ PROTON_ADD_CONFIG=... gamemoderun mangochill-client ... -- mangohud %command%
 gamescope --mangoapp mangochill-client ... %command%
 ```
 
+If stdout/stderr is unavailable, set `MANGOCHILL_LOG=/path/to/mangochill.log` to append logs to a file instead of stderr. `RUST_LOG` and `-v`/`-vv` still control filtering.
+
 ## Development
 
 ```sh

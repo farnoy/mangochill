@@ -1,4 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
+use anyhow::Context;
+#[cfg(not(target_arch = "wasm32"))]
 use capnp_rpc::{RpcSystem, rpc_twoparty_capnp::Side};
 #[cfg(not(target_arch = "wasm32"))]
 use chrono::{DateTime, Utc};
@@ -7,7 +9,7 @@ use mimalloc::MiMalloc;
 #[cfg(not(target_arch = "wasm32"))]
 use serde::{Deserialize, Serialize};
 #[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
+use std::{fs::OpenOptions, path::PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::net::UnixStream;
 #[cfg(not(target_arch = "wasm32"))]
@@ -73,10 +75,24 @@ pub async fn connect_rpc(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub fn init_logging(filter: log::LevelFilter) {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"))
-        .filter_level(filter)
-        .init();
+pub fn init_logging(filter: log::LevelFilter) -> anyhow::Result<()> {
+    let mut logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("error"));
+    logger.filter_level(filter);
+
+    if let Some(path) = std::env::var_os("MANGOCHILL_LOG").filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .context("failed to open MANGOCHILL_LOG")?;
+        logger.write_style(env_logger::WriteStyle::Never);
+        logger.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+
+    logger.init();
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]

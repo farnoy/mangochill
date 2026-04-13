@@ -77,7 +77,7 @@ fn mono_to_real(offset_us: i64, r: &mangochill_capnp::timestamp::Reader<'_>) -> 
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    mangochill::init_logging(cli.verbosity.log_level_filter());
+    mangochill::init_logging(cli.verbosity.log_level_filter())?;
 
     let rpc_socket = socket_path(cli.rpc_socket);
     let (rpc_system, mango_chill) = connect_rpc(&rpc_socket).await?;
