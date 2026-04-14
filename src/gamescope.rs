@@ -40,8 +40,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
             interface,
             version,
         } = event
-        {
-            if interface == "gamescope_control" && version >= MIN_VERSION {
+            && interface == "gamescope_control" && version >= MIN_VERSION {
                 info!("found gamescope_control v{version} (global {name})");
                 state.control = Some(registry.bind::<gamescope_control::GamescopeControl, _, _>(
                     name,
@@ -50,7 +49,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppData {
                     (),
                 ));
             }
-        }
     }
 }
 

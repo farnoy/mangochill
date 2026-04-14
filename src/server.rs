@@ -30,7 +30,7 @@ use tokio_util::{
     sync::CancellationToken,
     task::TaskTracker,
 };
-use tracing::{debug_span, trace_span};
+use tracing::trace_span;
 
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
