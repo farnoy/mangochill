@@ -227,26 +227,26 @@ async fn main() -> anyhow::Result<()> {
             break sink;
         }
         let Some((ref mut c, _)) = child else {
-            return Err(anyhow!(
+            bail!(
                 "No backend found. Is gamescope running, or is MangoHud \
                 configured with `control = mangohud-%p`?"
-            ));
+            );
         };
         if tokio::time::Instant::now() >= deadline {
-            return Err(anyhow!(
+            bail!(
                 "Timed out after {:?} waiting for a backend socket",
                 Duration::from_secs(cli.socket_timeout_secs),
-            ));
+            );
         }
         tokio::select! {
             _ = poll.tick() => {}
             status = c.wait() => {
                 let status = status?;
-                return Err(anyhow!(
+                bail!(
                     "Child exited ({status}) before a backend socket appeared. \
                     Is gamescope running, or is MangoHud configured with \
                     `control = mangohud-%p`?"
-                ));
+                );
             }
         }
     });
