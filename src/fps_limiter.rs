@@ -235,13 +235,13 @@ fn snap_to_divider(max_fps: u16, min_fps: u16, target: f64) -> f64 {
         // this matches gamescope's int division that computes `nVblankDivisor`
         // e.g. max_fps=90, n=4 => d=22.5 as u16, so 22
         let d = max_fps / n;
+        if d < min_fps {
+            break;
+        }
         if (d as f64 - target).abs() >= (best as f64 - target).abs() {
             break;
         }
         best = d;
-        if d <= min_fps {
-            break;
-        }
     }
     best as f64
 }
