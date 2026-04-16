@@ -155,8 +155,8 @@ fn detect_gamescope_max_fps(timeout: Duration) -> anyhow::Result<u16> {
     // Gamescope delays refresh rate changes by 600ms after focus to prevent mode flickering:
     // https://github.com/ValveSoftware/gamescope/blob/f8b33d38c5acc35825c7966b208222770c4a623e/src/steamcompmgr.cpp#L943-L944
     // Let's also wait for the game to initialize the window? idk
-    info!("Waiting 5 seconds for gamescope to settle on its intended refresh rate...");
-    std::thread::sleep(Duration::from_secs(5));
+    info!("Waiting 15 seconds for gamescope to settle on its intended refresh rate...");
+    std::thread::sleep(Duration::from_secs(15));
 
     let stdout = run_xprop(found_display, &["GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK"])?;
     let caps = refresh_re
