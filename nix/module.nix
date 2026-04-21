@@ -16,13 +16,13 @@ in
 
     package = lib.mkOption {
       type = lib.types.package;
-      default = inputs.self.packages.${pkgs.system}.mangochill;
+      default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.mangochill;
       description = "The MangoChill package to use.";
     };
 
     mangohudPackage = lib.mkOption {
       type = lib.types.package;
-      default = inputs.self.packages.${pkgs.system}.mangohud;
+      default = inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.mangohud;
       description = "The MangoHud package to use (custom fork with control socket support).";
     };
   };
