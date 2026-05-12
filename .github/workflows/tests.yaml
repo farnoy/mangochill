@@ -6,18 +6,25 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/nix
       - run: nix develop --quiet --command cargo --quiet nextest run
 
   miri-tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/nix
       - run: nix develop --quiet --command cargo --quiet miri nextest run
         env:
@@ -27,13 +34,17 @@ jobs:
   replay:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/nix
       - run: nix develop --quiet --command cargo --quiet run --bin mangochill-replay -- --input notebook/files/mouse-sample.ndjson
 
   replay-python:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/nix
       - run: cd notebook && devenv shell --quiet uv run python replay.py -i files/mouse-sample.ndjson
