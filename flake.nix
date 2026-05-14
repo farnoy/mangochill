@@ -120,7 +120,7 @@
               };
             };
           };
-          mangoOverride = oldAttrs: {
+          mangohud = pkgs.mangohud.overrideAttrs (oldAttrs: {
             src = mangosrc;
             postUnpack = ''
               (
@@ -147,12 +147,7 @@
                 unzip ${mangoSubprojects.vulkan-headers.patch}
               )
             '';
-          };
-          mangohud =
-            (pkgs.mangohud.override {
-              mangohud32 = pkgs.pkgsi686Linux.mangohud.overrideAttrs mangoOverride;
-            }).overrideAttrs
-              mangoOverride;
+          });
 
           devShell = pkgs.mkShell {
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ stdenv.cc.cc.lib ]);
