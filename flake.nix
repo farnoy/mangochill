@@ -6,10 +6,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-parts.url = "github:hercules-ci/flake-parts";
-    crate2nix = {
-      url = "github:nix-community/crate2nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
+    crane.url = "github:ipetkov/crane";
     cache-nix-action = {
       url = "github:nix-community/cache-nix-action";
       flake = false;
@@ -35,43 +32,37 @@
         { system, ... }:
         let
           fenixPkgs = inputs.fenix.packages.${system};
-          toolchainAttrs = {
-            channel = "nightly";
-            date = "2026-02-22";
-            sha256 = "sha256-viptHfVceErIpjvZQgo6i7CM3BjBlsH0r/nBKMEXP60=";
-          };
-          nightlyToolchain = fenixPkgs.toolchainOf toolchainAttrs;
-          wasmTarget = fenixPkgs.targets.wasm32-unknown-unknown.toolchainOf toolchainAttrs;
           rustToolchain = fenixPkgs.combine [
-            nightlyToolchain.completeToolchain
-            wasmTarget.rust-std
+            fenixPkgs.complete.toolchain
+            fenixPkgs.targets.wasm32-unknown-unknown.latest.rust-std
           ];
 
           pkgs = import inputs.nixpkgs {
             inherit system;
           };
 
-          cargoNix = inputs.crate2nix.tools.${system}.appliedCargoNix {
-            name = "mangochill";
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
+
+          # build.rs needs mangochill.capnp,
+          # src/gamescope.rs needs vendor/gamescope-control.xml
+          src = pkgs.lib.cleanSourceWith {
             src = ./.;
+            name = "mangochill-source";
+            filter =
+              path: type:
+              craneLib.filterCargoSources path type
+              || builtins.match ".*\\.capnp$" path != null
+              || builtins.match ".*/vendor/.*\\.xml$" path != null;
           };
 
-          mangochill =
-            (cargoNix.workspaceMembers.mangochill.build.override {
-              features = [ "mimalloc" "log/release_max_level_info" ];
-              crateOverrides = pkgs.defaultCrateOverrides // {
-                mangochill = attrs: {
-                  extraRustcOpts = attrs.extraRustcOpts ++ [
-                    "-C"
-                    "target-cpu=native"
-                  ];
-                  nativeBuildInputs = [ pkgs.capnproto ];
-                };
-              };
-            }).overrideAttrs
-              {
-                meta.mainProgram = "mangochill-server";
-              };
+          mangochill = craneLib.buildPackage {
+            inherit src;
+            strictDeps = true;
+            nativeBuildInputs = [ pkgs.capnproto ];
+            cargoExtraArgs = "--features mimalloc,log/release_max_level_info";
+            RUSTFLAGS = "-C target-cpu=native";
+            meta.mainProgram = "mangochill-server";
+          };
 
           mangosrc = pkgs.fetchFromGitHub {
             owner = "farnoy";
@@ -181,7 +172,7 @@
               inherit pkgs inputs;
               inputsInclude = [
                 "nixpkgs"
-                "crate2nix"
+                "crane"
                 "flake-parts"
                 "fenix"
                 "systems"
