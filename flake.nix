@@ -39,6 +39,9 @@
 
           pkgs = import inputs.nixpkgs {
             inherit system;
+            # Applied as an overlay so that pkgsi686Linux.mangohud, which
+            # upstream uses for the 32-bit Vulkan layer, gets the fork too.
+            overlays = [ mangohudOverlay ];
           };
 
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -111,34 +114,37 @@
               };
             };
           };
-          mangohud = pkgs.mangohud.overrideAttrs (oldAttrs: {
-            src = mangosrc;
-            postUnpack = ''
-              (
-                cd "$sourceRoot/subprojects"
-                cp -R --no-preserve=mode,ownership ${mangoSubprojects.imgui.src} imgui-${mangoSubprojects.imgui.version}
-                cp -R --no-preserve=mode,ownership ${mangoSubprojects.implot.src} implot-${mangoSubprojects.implot.version}
-                cp -R --no-preserve=mode,ownership ${mangoSubprojects.vulkan-headers.src} Vulkan-Headers-${mangoSubprojects.vulkan-headers.version}
-              )
-            '';
-            postPatch = ''
-              substituteInPlace bin/mangohud.in \
-                --subst-var-by libraryPath ${
-                  pkgs.lib.makeSearchPath "lib/mangohud" [
-                    (placeholder "out")
-                  ]
-                } \
-                --subst-var-by version "${oldAttrs.version}" \
-                --subst-var-by dataDir ${placeholder "out"}/share
+          mangohudOverlay = final: prev: {
+            mangohud = prev.mangohud.overrideAttrs (oldAttrs: {
+              src = mangosrc;
+              postUnpack = ''
+                (
+                  cd "$sourceRoot/subprojects"
+                  cp -R --no-preserve=mode,ownership ${mangoSubprojects.imgui.src} imgui-${mangoSubprojects.imgui.version}
+                  cp -R --no-preserve=mode,ownership ${mangoSubprojects.implot.src} implot-${mangoSubprojects.implot.version}
+                  cp -R --no-preserve=mode,ownership ${mangoSubprojects.vulkan-headers.src} Vulkan-Headers-${mangoSubprojects.vulkan-headers.version}
+                )
+              '';
+              postPatch = ''
+                substituteInPlace bin/mangohud.in \
+                  --subst-var-by libraryPath ${
+                    final.lib.makeSearchPath "lib/mangohud" (
+                      [ (placeholder "out") ]
+                      ++ final.lib.optional final.stdenv.hostPlatform.isx86_64 final.pkgsi686Linux.mangohud
+                    )
+                  } \
+                  --subst-var-by version "${oldAttrs.version}" \
+                  --subst-var-by dataDir ${placeholder "out"}/share
 
-              (
-                cd subprojects
-                unzip ${mangoSubprojects.imgui.patch}
-                unzip ${mangoSubprojects.implot.patch}
-                unzip ${mangoSubprojects.vulkan-headers.patch}
-              )
-            '';
-          });
+                (
+                  cd subprojects
+                  unzip ${mangoSubprojects.imgui.patch}
+                  unzip ${mangoSubprojects.implot.patch}
+                  unzip ${mangoSubprojects.vulkan-headers.patch}
+                )
+              '';
+            });
+          };
 
           devShell = pkgs.mkShell {
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (with pkgs; [ stdenv.cc.cc.lib ]);
@@ -162,26 +168,28 @@
                   --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.xorg.xprop ]}
               '';
             });
-            mangohud = mangohud;
+            mangohud = pkgs.mangohud;
+            saveFromGC =
+              (import "${cache-nix-action}/saveFromGC.nix" {
+                inherit pkgs inputs;
+                inputsInclude = [
+                  "nixpkgs"
+                  "crane"
+                  "flake-parts"
+                  "fenix"
+                  "systems"
+                ];
+                derivations = [
+                  devShell
+                ];
+                paths = [ ];
+              }).package;
+          }
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isx86_64 {
+            mangohud32 = pkgs.pkgsi686Linux.mangohud;
           };
 
           devShells.default = devShell;
-
-          packages.saveFromGC =
-            (import "${cache-nix-action}/saveFromGC.nix" {
-              inherit pkgs inputs;
-              inputsInclude = [
-                "nixpkgs"
-                "crane"
-                "flake-parts"
-                "fenix"
-                "systems"
-              ];
-              derivations = [
-                devShell
-              ];
-              paths = [ ];
-            }).package;
         };
     };
 }
